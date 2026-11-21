@@ -30,6 +30,17 @@ pub struct Kept {
 }
 
 impl Kept {
+    /// Keep the recovery when the screen asked to, and refuse before any
+    /// partition is touched when there is no installed Skyward to keep.
+    /// A temporary boot whose recovery is another one must not silently
+    /// turn into an install that leaves that other recovery behind.
+    pub fn hold_required(dir: &Path, current: Slot) -> Result<Kept> {
+        Self::hold(dir, current)?.with_context(|| format!(
+            "automatically flashing Skyward back needs Skyward installed in recovery{}; this partition holds another recovery. Install Skyward first, or turn off 'Flash Skyward again' before installing the package",
+            current.suffix()
+        ))
+    }
+
     /// Hold this recovery from the recovery partitions among the links in
     /// `dir`, before an install; none when the partition of the `current`
     /// slot does not hold Skyward, as when it was started without being

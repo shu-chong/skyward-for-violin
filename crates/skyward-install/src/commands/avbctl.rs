@@ -97,6 +97,42 @@ pub(super) fn run(args: &[OsString], io: &mut Io) -> i32 {
     avbctl(args, io, &Phone { by_name: Path::new(skyward_block::BY_NAME), suffix: &suffix, locked })
 }
 
+/// Turn off both of the phone's verified-boot checks in the slot it is
+/// running from: dm-verity (`HASHTREE_DISABLED`) and the bootloader's own
+/// partition check (`VERIFICATION_DISABLED`). This is the same two flags a
+/// script would clear with `avbctl disable-verity` and
+/// `avbctl disable-verification`, here as one step for the Advanced page.
+/// A locked bootloader is refused: it would not start a slot whose vbmeta
+/// was changed. Returns what to tell the user.
+pub fn disable_both() -> std::io::Result<()> {
+    let suffix = skyward_sys::prop("ro.boot.slot_suffix").unwrap_or_default();
+    // Be conservative: refuse if either sign says the bootloader is locked.
+    // A missing vbmeta property must not be read as "unlocked" — elsewhere
+    // this device reports the lock state through the flash-locked boot
+    // parameter, and writing vbmeta on a locked device can stop it booting.
+    let vbmeta_locked = skyward_sys::prop("ro.boot.vbmeta.device_state").as_deref() == Some("locked");
+    // Only an explicit "1" means locked. A missing parameter must not be
+    // read as locked: this bootloader reports the state through the
+    // ro.boot property above and leaves the cmdline parameter unset.
+    let flash_locked = skyward_block::boot_param("androidboot.flash.locked")
+        .ok()
+        .flatten()
+        .as_deref() == Some("1");
+    if vbmeta_locked || flash_locked {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the bootloader is locked"));
+    }
+    let phone = Phone { by_name: Path::new(skyward_block::BY_NAME), suffix: &suffix, locked: false };
+    let (path, at) = top_level(&phone)?;
+    let mut file = OpenOptions::new().read(true).write(true).open(&path).map_err(|e| about(&path, e))?;
+    let mut head = header(&mut file, &path, at)?;
+    for check in [Check::Verity, Check::Verification] {
+        let flags = flags(&head) | check.off();
+        head[FLAGS_AT..FLAGS_AT + 4].copy_from_slice(&flags.to_be_bytes());
+    }
+    file.seek(SeekFrom::Start(at)).and_then(|_| file.write_all(&head)).and_then(|()| file.sync_all()).map_err(|e| about(&path, e))?;
+    Ok(())
+}
+
 fn avbctl(args: &[OsString], io: &mut Io, phone: &Phone) -> i32 {
     let (mut force, mut command) = (false, None);
     // Of the commands given the last counts, and anything else is passed

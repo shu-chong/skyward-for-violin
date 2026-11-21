@@ -57,6 +57,8 @@ impl App {
                     Switch::Signature => &mut self.state.check_signature,
                     Switch::KeepRecovery => &mut self.state.keep_recovery,
                     Switch::ShowPassword => &mut self.state.show_password,
+                    Switch::DoubleTap => &mut self.state.double_tap,
+                    Switch::WlanAuto => &mut self.state.wlan_auto,
                     Switch::Wlan => unreachable!("the WLAN switch is turned above"),
                 };
                 *on = !*on;
@@ -551,6 +553,17 @@ impl App {
                     return vec![Effect::UpdateSkyward(build)];
                 }
             }
+            Action::UpdateSkywardFile => {
+                if !matches!(self.state.install, Install::Idle | Install::Finished { .. }) {
+                    self.say(l.pick(INSTALL_UNFINISHED), now);
+                    return Vec::new();
+                }
+                if !self.state.updating_skyward() {
+                    self.state.skyward_job = Some(SkywardJob { stage: None, rate: 0, outcome: None, stopping: false });
+                    self.refresh();
+                    return vec![Effect::UpdateSkywardFile];
+                }
+            }
             // Only the download stops: writing, once begun, goes on to its
             // end.
             Action::StopSkywardUpdate => {
@@ -701,6 +714,7 @@ impl App {
     pub(super) fn confirmed(&mut self, which: Confirm, now: u64) -> Vec<Effect> {
         let (l, mut fx) = (self.state.lang, Vec::new());
         match which {
+            Confirm::UnlockScreen => self.unlocked(),
             Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),
             Confirm::Wipe => {
                 let chosen: Vec<Wipe> = WIPES.iter().zip(self.state.wipe).filter(|(_, on)| *on).map(|(&w, _)| w).collect();
@@ -711,7 +725,9 @@ impl App {
             }
             Confirm::Install | Confirm::InstallWipe => {
                 if let Install::Confirming { version, .. } = &self.state.install {
-                    self.state.install = Install::Updating { version: version.clone(), stage: None, overwriting: false };
+                    // The installer names the file it reads the package from
+                    // as it starts writing, which is a moment away.
+                    self.state.install = Install::Updating { version: version.clone(), path: None, stage: None, overwriting: false };
                     fx.push(Effect::Install);
                     self.refresh();
                 }
@@ -770,8 +786,13 @@ impl App {
                 _ => self.say(l.pick(["无法读取启动槽位", "無法讀取啟動槽位", "Couldn't read the boot slots"]), now),
             },
             Confirm::FactoryReset => fx.push(Effect::FactoryReset),
+            Confirm::DisableAvb => fx.push(Effect::DisableAvb),
             Confirm::Merge => {
-                if self.state.update == Standing::Waiting {
+                // An update is merged where it lies: the slot the phone
+                // runs from reads through it, and one written to the other
+                // slot is merged there, as the recovery does after an
+                // install. A merge that failed is tried again the same way.
+                if matches!(self.state.update, Standing::Waiting | Standing::Installed(_) | Standing::Failed(_)) {
                     self.state.update = Standing::Merging(0.0);
                     self.refresh();
                     fx.push(Effect::Merge);

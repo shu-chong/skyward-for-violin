@@ -219,7 +219,8 @@ fn main() -> Result<()> {
             "33-sideload-writing-dark",
             true,
             Install::Updating {
-                version: Some("OS4.0.5.0.XPACNXM".into()),
+                version: Some("17OS4.0.261112.190429467.XPRDCN.S".into()),
+                path: Some("/sdcard/Documents/violin-ota_full-OS4.0.6.0.XOTCNXM-user-17.0-e0b0fc6c62.zip".into()),
                 stage: Some(Stage::Writing { done: 2_934_000_000, total: 7_103_041_280 }),
                 overwriting: true,
             },
@@ -229,6 +230,7 @@ fn main() -> Result<()> {
             false,
             Install::Updating {
                 version: Some("OS4.0.5.0.XPACNXM".into()),
+                path: None,
                 stage: Some(Stage::Verifying { index: 6, count: 21, partition: "system".into() }),
                 overwriting: false,
             },
@@ -280,6 +282,9 @@ fn main() -> Result<()> {
     for (name, dark, install) in installing {
         let mut app = opened(Screen::Installing, w, h, ppd);
         app.state.dark = dark;
+        // A job under way carries its timer, drawn at the card's top right,
+        // as the app counts it once a second.
+        app.state.install_secs = matches!(&install, Install::Updating { .. }).then_some(312);
         app.state.install = install;
         let path = out.join(format!("{name}.png"));
         write_png(&path, &whole_page(&mut app, &fonts, &info))?;
@@ -429,7 +434,12 @@ fn main() -> Result<()> {
         }),
         ("20-install-storage-writing-dark", Screen::Installing, true, &|app| {
             let stage = Some(Stage::Writing { done: 2_934_000_000, total: 7_014_220_000 });
-            from_storage(app, Install::Updating { version: Some("OS3.0.305.0.WMACNXM".into()), stage, overwriting: false })
+            from_storage(app, Install::Updating {
+                version: Some("OS3.0.305.0.WMACNXM".into()),
+                path: Some("/sdcard/Download/OS3.0.305.0.WMACNXM.zip".into()),
+                stage,
+                overwriting: false,
+            })
         }),
         ("20-install-storage-refused", Screen::Installing, false, &|app| {
             from_storage(app, Install::Finished { outcome: Outcome::Refused(Refusal::Unknown), damage: None })

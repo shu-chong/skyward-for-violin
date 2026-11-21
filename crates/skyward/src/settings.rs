@@ -32,7 +32,17 @@ pub fn read() -> Result<Kept> {
 fn read_file() -> Result<Kept> {
     match fs::read_to_string(FILE) {
         Ok(text) => match Settings::read(&text) {
-            Ok(settings) => Ok(Kept::Settings(settings)),
+            Ok(settings) => {
+                // An older build kept the phone's screen lock password as
+                // plain text in this file. This build has no such field, so
+                // ask for the file to be written afresh: the text then
+                // leaves /metadata instead of sitting there unread.
+                if text.contains("\"data_password\"") {
+                    skyward_sys::kmsg("the kept screen lock password is being erased from the settings")?;
+                    return Ok(Kept::Nothing);
+                }
+                Ok(Kept::Settings(settings))
+            }
             Err(e) => {
                 skyward_sys::kmsg(&format!("{FILE} does not read as settings, and is written afresh: {e:#}"))?;
                 Ok(Kept::Nothing)
@@ -56,8 +66,32 @@ pub fn write(settings: &Settings) -> Result<()> {
 }
 
 fn write_file(settings: &Settings) -> Result<()> {
-    fs::create_dir_all(FOLDER).with_context(|| format!("make {FOLDER}"))?;
-    let mut file = File::create(WRITING).with_context(|| format!("make {WRITING}"))?;
+    // The file can hold a saved WLAN password as plain text. Create it private
+    // from the start: `File::create` would briefly make it 0644 (umask 022)
+    // before a later chmod, leaving a window where another process could
+    // read it. On Android every write here is 0600 from the first open.
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        if let Err(e) = builder.create(FOLDER) {
+            skyward_sys::kmsg(&format!("settings: could not make {FOLDER} private: {e:#}"))?;
+        }
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(WRITING)
+            .with_context(|| format!("make {WRITING}"))?;
+        f
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        fs::create_dir_all(FOLDER).with_context(|| format!("make {FOLDER}"))?;
+        File::create(WRITING).with_context(|| format!("make {WRITING}"))?
+    };
     file.write_all(settings.text().as_bytes()).with_context(|| format!("write {WRITING}"))?;
     file.sync_all().with_context(|| format!("write {WRITING}"))?;
     fs::rename(WRITING, FILE).with_context(|| format!("move {WRITING} over {FILE}"))?;

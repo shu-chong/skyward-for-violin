@@ -4,8 +4,15 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Where the phone's own partitions keep the table.
+/// Where the phone's own partitions keep the table, under the names most
+/// phones give it.
 pub const FILES: [&str; 2] = ["/vendor/etc/fstab.qcom", "/odm/etc/fstab.qcom"];
+
+/// The folders a phone keeps its tables in. One that does not name its
+/// table `fstab.qcom` - it is named after its own hardware, as `fstab` on
+/// a phone whose platform is `O1_asic` is `fstab.O1_asic` - keeps it in one
+/// of these all the same.
+const FOLDERS: [&str; 2] = ["/vendor/etc", "/odm/etc"];
 
 /// One filesystem the phone knows about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,15 +61,66 @@ pub fn entries(text: &str) -> Vec<Entry> {
 /// Every entry of the phone's own table, read from wherever the table is.
 fn table() -> Result<Vec<Entry>> {
     let mut out = Vec::new();
-    for file in FILES {
-        let text = match std::fs::read_to_string(file) {
+    for file in files() {
+        let text = match std::fs::read_to_string(&file) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("read {file}")),
+            Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
         };
-        out.extend(entries(&text));
+        let mut parsed = entries(&text);
+        // Keep the installed system's encrypted data: never repair or
+        // format it from a recovery, and keep its calibration partitions
+        // read-only without replaying their journals.
+        preserve_o1_data(&mut parsed);
+        out.extend(parsed);
     }
     Ok(out)
+}
+
+fn files() -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = FILES.iter().map(PathBuf::from).collect();
+    let mut found: Vec<PathBuf> = Vec::new();
+    for folder in FOLDERS {
+        let Ok(listing) = std::fs::read_dir(folder) else { continue };
+        for entry in listing.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("fstab.") {
+                continue;
+            }
+            let path = entry.path();
+            if !files.contains(&path) && !found.contains(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    files.extend(found);
+    files
+}
+
+fn preserve_o1_data(entries: &mut Vec<Entry>) {
+    // The stock recovery maps rescue to /cache; it is not a cache to wipe.
+    entries.retain(|entry| {
+        !(entry.mount_point == "/cache"
+            && Path::new(&entry.device).file_name().is_some_and(|name| name == "rescue"))
+    });
+    for entry in entries {
+        if matches!(entry.mount_point.as_str(), "/data" | "/metadata" | "/mnt/vendor/persist" | "/mnt/vendor/nvdata") {
+            entry.extras.retain(|flag| !matches!(flag.as_str(), "check" | "formattable" | "resize"));
+        }
+        if matches!(entry.mount_point.as_str(), "/mnt/vendor/persist" | "/mnt/vendor/nvdata") {
+            entry.options.retain(|option| option != "rw");
+            entry.options.retain(|option| {
+                !matches!(option.as_str(), "noauto_da_alloc" | "nodelalloc") && !option.starts_with("commit=")
+            });
+            for option in ["ro", "noload"] {
+                if !entry.options.iter().any(|existing| existing == option) {
+                    entry.options.push(option.into());
+                }
+            }
+        }
+    }
 }
 
 /// What the phone's own table says about `mount_point`.

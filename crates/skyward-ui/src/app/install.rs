@@ -81,8 +81,9 @@ pub enum Install {
     /// whether all user data is erased after it.
     Confirming { version: Option<String>, wipe: bool },
     /// `overwriting` says whether the update writes over the running
-    /// system.
-    Updating { version: Option<String>, stage: Option<Stage>, overwriting: bool },
+    /// system; `path` is the file it is read from, where it is a file on the
+    /// phone rather than one the computer sends.
+    Updating { version: Option<String>, path: Option<String>, stage: Option<Stage>, overwriting: bool },
     Flashing { partition: &'static str, stage: Option<Stage> },
     /// A zip with an install script waits for the user to agree to run it.
     ConfirmingScript,
@@ -229,7 +230,7 @@ impl App {
             Event::Waiting => *install = Install::Waiting,
             Event::Checking { size } => *install = Install::Checking { size, stage: None },
             Event::Ready { version, wipe } => *install = Install::Confirming { version, wipe },
-            Event::Installing { version } => *install = Install::Updating { version, stage: None, overwriting: false },
+            Event::Installing { version, path } => *install = Install::Updating { version, path, stage: None, overwriting: false },
             Event::Overwriting => {
                 if let Install::Updating { overwriting, .. } = install {
                     *overwriting = true;
@@ -316,6 +317,40 @@ mod tests {
     use super::*;
     use crate::app::testing::*;
     use skyward_install::Failure;
+
+    #[test]
+    fn the_side_column_is_shut_while_every_kind_of_install_is_busy() {
+        // The side column reaches pages the back key cannot, so both must
+        // refuse the same busy states. Wiping erases all user data; letting
+        // the column leave that page hid its progress and missed its end.
+        let busy = [
+            Install::Starting,
+            Install::Opening,
+            Install::Locked(0),
+            Install::Waiting,
+            Install::Checking { size: 1, stage: None },
+            Install::Flashing { partition: "boot", stage: None },
+            Install::Wiping,
+            Install::Scripting { stage: None, running: true },
+            Install::Updating { version: None, path: None, stage: None, overwriting: false },
+        ];
+        for state in busy {
+            let mut app = App::new(Screen::Installing, W, H, PPD);
+            app.state.install = state.clone();
+            assert!(!app.navigation_open(), "the side column must stay shut in {state:?}");
+        }
+        let free = [
+            Install::Idle,
+            Install::Finished { outcome: skyward_install::Outcome::Cancelled, damage: None },
+            Install::Wiped(Ok(())),
+            Install::Ending,
+        ];
+        for state in free {
+            let mut app = App::new(Screen::Installing, W, H, PPD);
+            app.state.install = state.clone();
+            assert!(app.navigation_open(), "the side column must work again in {state:?}");
+        }
+    }
 
     #[test]
     fn leaving_while_waiting_cancels_and_the_end_clears_it() {
@@ -427,7 +462,7 @@ mod tests {
         app.touch(Touch::Down(track.x + track.h / 2.0, y), &f, 1000);
         app.touch(Touch::Move(track.x + track.w, y), &f, 1000);
         assert_eq!(app.touch(Touch::Up, &f, 1000), vec![Effect::Install]);
-        assert_eq!(app.state.install, Install::Updating { version: Some("OS3.0.306.0.WMACNXM".into()), stage: None, overwriting: false });
+        assert_eq!(app.state.install, Install::Updating { version: Some("OS3.0.306.0.WMACNXM".into()), path: None, stage: None, overwriting: false });
         app.key(Key::Back, 1000);
         assert_eq!(app.screen(), Screen::Installing, "an update being written keeps the page");
 

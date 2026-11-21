@@ -80,6 +80,11 @@ impl App {
     /// and in a place, until it reaches the place's top.
     pub(super) fn back(&mut self, now: u64) -> Vec<Effect> {
         let (l, mut fx) = (self.state.lang, Vec::new());
+        // The lock is not a page to go back from: it owns the whole panel
+        // until its code or swipe has been given.
+        if self.screen() == Screen::Lock {
+            return fx;
+        }
         if self.stack.len() <= 1 {
             return fx;
         }

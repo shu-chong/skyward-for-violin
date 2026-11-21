@@ -295,8 +295,6 @@ mod device {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
 
     /// Big enough for any request: the kernel asks for at least 8 KiB, and
@@ -312,7 +310,6 @@ mod device {
     /// The filesystem, served from a thread of its own out of `S`.
     pub struct Mount<S> {
         thread: JoinHandle<(S, Result<Option<Fault>>)>,
-        served: Arc<AtomicU64>,
     }
 
     /// Mount the package `offer` describes at /sideload, read-only.
@@ -348,22 +345,20 @@ mod device {
     impl Mounted {
         /// Serve the package from `source`.
         pub fn serve<S: Source + Send + 'static>(self, source: S) -> Mount<S> {
-            let served = Arc::new(AtomicU64::new(0));
-            let reach = served.clone();
             let thread = thread::Builder::new()
                 .name("sideload-fuse".into())
                 .spawn(move || {
                     let mut source = source;
                     let mut server = Server::new(self.offer);
-                    let result = serve(&self.dev, &mut server, &mut source, &reach);
+                    let result = serve(&self.dev, &mut server, &mut source);
                     (source, result.map(|()| server.fault().cloned()))
                 })
                 .expect("the FUSE thread starts");
-            Mount { thread, served }
+            Mount { thread }
         }
     }
 
-    fn serve(dev: &File, server: &mut Server, source: &mut impl Source, served: &AtomicU64) -> Result<()> {
+    fn serve(dev: &File, server: &mut Server, source: &mut impl Source) -> Result<()> {
         let mut buf = vec![0u8; REQUEST_BUFFER];
         loop {
             let n = match { dev }.read(&mut buf) {
@@ -375,7 +370,6 @@ mod device {
             };
             let mut fetch = |index: u64, out: &mut [u8]| source.read_block(index, out);
             let handled = server.handle(&buf[..n], &mut fetch)?;
-            served.store(server.served(), Ordering::Relaxed);
             match handled {
                 Handled::Reply(r) => answer(dev, &r)?,
                 Handled::Silent => {}
@@ -395,11 +389,6 @@ mod device {
     }
 
     impl<S> Mount<S> {
-        /// How far into the package reads have reached.
-        pub fn served(&self) -> u64 {
-            self.served.load(Ordering::Relaxed)
-        }
-
         /// Stop serving and unmount. The source always comes back; the
         /// result says whether serving went well, and why the package
         /// stopped being readable if it did.

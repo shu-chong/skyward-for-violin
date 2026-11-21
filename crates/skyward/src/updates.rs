@@ -47,6 +47,9 @@ pub enum Task {
     /// partitions of the slot that starts next and of any other slot that
     /// holds Skyward.
     UpdateSkyward { build: Build, codename: String, path: PathBuf },
+    /// Check the recovery image already on the phone and write it into the
+    /// recovery partitions, without asking GitHub for anything.
+    UpdateSkywardFile { path: PathBuf, codename: String },
 }
 
 pub enum Event {
@@ -134,6 +137,9 @@ impl Worker {
                     let sum = Sum::Md5(release.md5.clone());
                     let end = fetch(&servers, release.urls.clone(), &sum, &release.name, &path, &stopping, &using, &tell, &mut refused);
                     tell(Event::Ended(end));
+                }
+                Task::UpdateSkywardFile { path, codename } => {
+                    tell(Event::Ended(write_raw(&path, &codename, &tell)));
                 }
                 Task::CheckSkyward { probe, codename } => {
                     let a = http::agent(servers.clone());
@@ -331,9 +337,19 @@ fn fetch(
 /// next and of any other slot that holds Skyward, telling how far that has
 /// come.
 fn write(path: &Path, codename: &str, tell: &dyn Fn(Event)) -> End {
+    write_image(|| upgrade::unzip(path), codename, tell)
+}
+
+/// Write the recovery image at `path` itself, checked as Skyward for the
+/// phone, into the recovery partitions. No network is needed for this.
+fn write_raw(path: &Path, codename: &str, tell: &dyn Fn(Event)) -> End {
+    write_image(|| std::fs::read(path).with_context(|| format!("read {}", path.display())), codename, tell)
+}
+
+fn write_image(read: impl Fn() -> Result<Vec<u8>>, codename: &str, tell: &dyn Fn(Event)) -> End {
     let dir = Path::new(skyward_block::BY_NAME);
     let ready = || -> Result<(Vec<u8>, Vec<Slot>)> {
-        let image = upgrade::unzip(path)?;
+        let image = read()?;
         upgrade::check(&image, codename)?;
         let next = skyward_vab::boot::next_slot().context("ask which slot starts next")?;
         Ok((image, upgrade::slots(dir, next)?))

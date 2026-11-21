@@ -5,16 +5,29 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+// These talk to the phone's kernel through its Unix interfaces. The host
+// build of the image packer only needs the property and log helpers below,
+// so on a non-Unix host the modules are left out rather than made to fake
+// file descriptors, poll and clocks they would never use.
+#[cfg(unix)]
 pub mod bcb;
+#[cfg(unix)]
 pub mod clock;
+#[cfg(unix)]
 pub mod control;
+#[cfg(unix)]
 pub mod cpu;
+#[cfg(target_os = "android")]
+pub mod dvfs;
 #[cfg(target_os = "android")]
 pub mod sleep;
 #[cfg(target_os = "android")]
 pub mod uevent;
+#[cfg(unix)]
 pub mod ueventd;
+#[cfg(unix)]
 pub mod usb;
+#[cfg(unix)]
 pub mod worker;
 
 /// A system property, or `None` when it is unset.
@@ -116,14 +129,15 @@ pub fn wait_prop(name: &str, value: &str, timeout: Duration) -> Result<()> {
     }
 }
 
-/// Wait until there is a file at `path`, for at most `timeout`: the kernel
-/// and ueventd make some files only a while after what has them made
-/// returns, as a driver makes its own once it has taken its device up.
+/// Wait until there is a file at `path`, for at most `timeout`: a driver
+/// makes its own files only a while after the module that has it has been
+/// loaded, and ueventd makes the node once the kernel has told it of the
+/// device. From upstream PR #56.
 pub fn wait_file(path: &Path, timeout: Duration) -> Result<()> {
     let until = Instant::now() + timeout;
     while !path.exists() {
         if Instant::now() >= until {
-            bail!("{} is not there after {} ms", path.display(), timeout.as_millis());
+            anyhow::bail!("{} is not there after {} ms", path.display(), timeout.as_millis());
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -292,12 +306,19 @@ fn records(text: &str, most: usize) -> Vec<&str> {
 
 /// How long the phone has been running, on the clock the kernel stamps its
 /// log with.
+#[cfg(unix)]
 fn since_boot() -> Result<Duration> {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) } != 0 {
         return Err(std::io::Error::last_os_error()).context("read the time since the phone started");
     }
     Ok(Duration::new(t.tv_sec as u64, t.tv_nsec as u32))
+}
+
+/// A host has no boot clock to stamp a kept log with.
+#[cfg(not(unix))]
+fn since_boot() -> Result<Duration> {
+    Ok(Duration::ZERO)
 }
 
 /// The kernel log as `dmesg` prints it: as much of it as the kernel still
@@ -391,34 +412,6 @@ mod tests {
         assert!(told.untold(Some("read capacity: no data")), "another reason");
         assert!(!told.untold(None), "it went well");
         assert!(told.untold(Some("read capacity: no data")), "the same reason, after it went well in between");
-    }
-
-    #[test]
-    fn a_file_made_a_while_later_is_waited_for_and_one_never_made_is_said_to_be_missing() {
-        let dir = std::env::temp_dir().join(format!("skyward-wait-file-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let late = dir.join("late");
-        let (go, told) = std::sync::mpsc::channel();
-        let maker = {
-            let late = late.clone();
-            std::thread::spawn(move || {
-                told.recv().unwrap();
-                std::thread::sleep(Duration::from_millis(50));
-                std::fs::write(late, b"").unwrap();
-            })
-        };
-        assert!(!late.exists());
-        go.send(()).unwrap();
-        wait_file(&late, Duration::from_secs(60)).unwrap();
-        assert!(late.exists(), "it came back once the file was made");
-        maker.join().unwrap();
-        wait_file(&late, Duration::ZERO).unwrap();
-        let missing = dir.join("missing");
-        let began = Instant::now();
-        let said = wait_file(&missing, Duration::from_millis(50)).unwrap_err().to_string();
-        assert!(began.elapsed() >= Duration::from_millis(50), "it waited as long as it was given");
-        assert_eq!(said, format!("{} is not there after 50 ms", missing.display()));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

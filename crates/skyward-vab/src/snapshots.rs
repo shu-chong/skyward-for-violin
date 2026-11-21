@@ -556,19 +556,27 @@ pub enum Merge {
     Idle(UpdateState),
 }
 
-/// Start merging the update into the slot the phone runs from, as
+/// Start merging the update into `target`, the slot the update went to, as
 /// libsnapshot does once the system the update put there has started: each
 /// snapshot becomes a merging one, and the kernel writes it into the
-/// partition it snapshots. From here there is no going back to the slot the
-/// update came from. Snapshots of partitions flashed over since are left
-/// out, and their copy-on-write devices taken away.
-pub fn initiate(snaps: &Snapshots, current: Slot, md: &Metadata, tell: &dyn Fn(MergeStatus) -> Result<()>) -> Result<()> {
+/// partition it snapshots. The recovery starts the same merge for the other
+/// slot while the data partition is open, before the system that would
+/// start it can. From here there is no going back to the slot the update
+/// came from. Snapshots of partitions flashed over since are left out, and
+/// their copy-on-write devices taken away.
+pub fn initiate(snaps: &Snapshots, target: Slot, md: &Metadata, tell: &dyn Fn(MergeStatus) -> Result<()>) -> Result<()> {
     let mut update = snaps.update()?;
-    ensure!(state_of(&update)? == UpdateState::Unverified, "the update has not been written all the way, or is merging already");
-    ensure!(snaps.side(current)? == Side::Target, "the phone runs from the slot the update came from, not the one it went to");
+    // A merge that failed is started again the same way: every snapshot is
+    // switched to merging once more, which is what a target that could not
+    // be switched needs. A merge already under way is only followed.
+    ensure!(
+        matches!(state_of(&update)?, UpdateState::Unverified | UpdateState::MergeFailed),
+        "the update has not been written all the way, or is merging already"
+    );
+    ensure!(snaps.side(target)? == Side::Target, "{target:?} is not the slot the update went to");
     ensure!(!update.using_snapuserd, "the update's snapshots are compressed and served by snapuserd, which this recovery does not run");
     let mut names = snaps.list()?;
-    for name in names.iter().filter(|n| n.ends_with(current.suffix())) {
+    for name in names.iter().filter(|n| n.ends_with(target.suffix())) {
         ensure!(dm::status(name)?.is_some(), "{name} is not mapped, and everything has to merge at once");
     }
     let mut kept = Vec::new();

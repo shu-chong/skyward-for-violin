@@ -44,6 +44,19 @@ pub mod ramdisk {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceConfig {
     pub device: Device,
+    /// Whether the USB port offers file transfer beside adb. A build
+    /// without it keeps the single adb function from boot to reboot, so a
+    /// Windows host never has to re-enumerate the composite device and
+    /// lose the ADB interface.
+    #[serde(default = "default_true")]
+    pub mtp: bool,
+    /// Bring file transfer up by itself only once the data partition is
+    /// decrypted. The port still comes up adb-only, so the gadget rebind
+    /// (and the Windows re-enumeration that follows) happens after the
+    /// owner has unlocked their files, never during boot. The MTP init
+    /// rules have to be in the ramdisk for this to work.
+    #[serde(default)]
+    pub mtp_after_decrypt: bool,
     #[serde(default)]
     pub display: Display,
     #[serde(default)]
@@ -110,6 +123,10 @@ pub struct Wlan {
     /// what tells a platform driver it may start the chip.
     #[serde(default)]
     pub writes: Vec<Write>,
+    /// What is written when the user turns WLAN off, to hand the shared
+    /// chip's power control back to the platform driver.
+    #[serde(default)]
+    pub off_writes: Vec<Write>,
     /// Files the driver asks the kernel's firmware loader for that are not
     /// where the loader looks in a recovery.
     #[serde(default)]
@@ -271,6 +288,11 @@ pub struct Device {
     /// System property that carries the vendor OS version.
     #[serde(default = "default_os_version_prop")]
     pub os_version_prop: String,
+    /// Whether the device has a vibration motor. A pad without one keeps
+    /// the vibration setting off its settings page and never asks for a
+    /// tap; the other phones keep the setting they have always had.
+    #[serde(default = "default_true")]
+    pub supports_vibration: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -288,6 +310,22 @@ pub struct Display {
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
     pub corner_radius: u32,
+    /// The panel's refresh rate in Hz to scan out at. A controller that
+    /// cannot drive the fastest mode the panel offers without the DSC or
+    /// bandwidth vote a recovery does not set up is told the rate to keep
+    /// to instead; none keeps the fastest.
+    #[serde(default)]
+    pub refresh: Option<u32>,
+    /// Degrees the portrait logical canvas is turned onto a landscape panel:
+    /// 90 clockwise, 270 counter-clockwise, 0 leaves it as it is. A pad whose
+    /// panel is scanned out landscape is held portrait, so the pages have to
+    /// be turned on their way to the framebuffer and a finger turned back.
+    #[serde(default)]
+    pub rotate: u32,
+    /// Width in logical pixels of a permanent navigation column kept beside
+    /// the pages, as a tablet's UI has; 0 keeps the phone's single column.
+    #[serde(default)]
+    pub columns: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -317,6 +355,10 @@ pub struct Touch {
     /// step of starting the controller.
     #[serde(default)]
     pub writes: Vec<Write>,
+    /// Which of the screen's own axes the panel reports the other way round,
+    /// as a panel mounted across the screen can.
+    #[serde(default)]
+    pub reversed: Vec<String>,
 }
 
 /// Partitions as the phone itself mounts them.
@@ -365,6 +407,12 @@ pub struct Service {
     /// as the interface and then which of them it is.
     #[serde(default)]
     pub ready_hardware_service: Option<String>,
+    /// The program may not become ready at all, and the recovery is still
+    /// usable without it. Where it does not, that is said in the kernel log
+    /// and the programs after it start all the same, rather than the whole
+    /// recovery service ending.
+    #[serde(default)]
+    pub optional: bool,
     /// Where one model's hardware comes in more than one build, the
     /// installed system's own properties say which build it is: the program
     /// runs only where the property has this value.
@@ -502,7 +550,7 @@ impl DeviceConfig {
             let path = Path::new(log);
             let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
             ensure!(
-                path.is_absolute() && plain && path.starts_with(DATA) && path != Path::new(DATA),
+                log.starts_with('/') && plain && path.starts_with(DATA) && path != Path::new(DATA),
                 "[wipe] logs: {log} is not a folder inside {DATA}"
             );
         }
@@ -540,7 +588,7 @@ impl DeviceConfig {
         }
         if let Some(haptics) = &cfg.haptics {
             let file = &haptics.resonance;
-            ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            ensure!(file.starts_with('/'), "[haptics] resonance: {file} is not an absolute path");
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
                 0.0 < lightest && lightest < strongest && strongest <= 1.0,
@@ -551,7 +599,7 @@ impl DeviceConfig {
             for library in &logd.libraries {
                 let path = Path::new(library);
                 let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
-                ensure!(path.is_absolute() && plain && path.file_name().is_some(), "[logd] libraries: {library} is not an absolute path to a file");
+                ensure!(library.starts_with('/') && plain && path.file_name().is_some(), "[logd] libraries: {library} is not an absolute path to a file");
             }
         }
         for owners in &cfg.owners {
@@ -563,7 +611,7 @@ impl DeviceConfig {
             for file in &owners.paths {
                 let path = Path::new(file);
                 let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
-                ensure!(path.is_absolute() && plain && path.file_name().is_some(), "[[owners]] paths: {file} is not an absolute path to a file");
+                ensure!(file.starts_with('/') && plain && path.file_name().is_some(), "[[owners]] paths: {file} is not an absolute path to a file");
             }
         }
         if let Some(stock) = &cfg.stock {
@@ -596,7 +644,7 @@ impl DeviceConfig {
                         );
                         ensure!(plain && !file.path.is_empty(), "[wlan] firmware: {} is not a path from the top of {partition}", file.path);
                     }
-                    None => ensure!(path.is_absolute(), "[wlan] firmware: {} is not an absolute path", file.path),
+                    None => ensure!(file.path.starts_with('/'), "[wlan] firmware: {} is not an absolute path", file.path),
                 }
             }
         }

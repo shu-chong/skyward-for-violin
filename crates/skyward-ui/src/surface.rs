@@ -515,7 +515,7 @@ pub mod kms {
     }
 
     impl KmsSurface {
-        pub fn open(path: &str) -> Result<Self> {
+        pub fn open(path: &str, refresh: Option<u32>) -> Result<Self> {
             let card = open_card(path)?;
             let res = card.resource_handles().context("read KMS resources")?;
 
@@ -535,14 +535,29 @@ pub mod kms {
                 .ok_or_else(|| anyhow!("the panel reports no preferred mode"))?;
             // The fastest refresh at the preferred size, the first listed among
             // equals: Android scrolls at it, and the 13 Ultra's touch reports
-            // come at the same 120 Hz.
-            let mode = *conn
-                .modes()
-                .iter()
-                .filter(|m| m.size() == preferred.size())
-                .rev()
-                .max_by_key(|m| m.vrefresh())
-                .expect("the preferred mode itself has the preferred size");
+            // come at the same 120 Hz. A controller that cannot drive the
+            // fastest without a DSC or bandwidth vote the recovery does not
+            // make is told the rate to keep to instead.
+            let mode = match refresh {
+                Some(hz) => *conn
+                    .modes()
+                    .iter()
+                    .find(|m| m.size() == preferred.size() && m.vrefresh() == hz)
+                    .ok_or_else(|| anyhow!("the panel offers no {hz} Hz mode at its preferred size"))?,
+                None => *conn
+                    .modes()
+                    .iter()
+                    .filter(|m| m.size() == preferred.size())
+                    .rev()
+                    .max_by_key(|m| m.vrefresh())
+                    .expect("the preferred mode itself has the preferred size"),
+            };
+            // The panel is brought up in `preferred`, then switched to `mode`,
+            // and every time it comes on again it starts at `preferred` once
+            // more. A panel kept at a configured rate has to come up at that
+            // rate too, or the first frames - and each wake - are scanned out
+            // at the rate the controller cannot drive.
+            let preferred = if refresh.is_some() { &mode } else { preferred };
             let (w, h) = (mode.size().0 as u32, mode.size().1 as u32);
 
             // The CRTC already driving the panel, or the first one an
@@ -795,6 +810,20 @@ pub mod kms {
             }
             self.settle()?;
             let mut req = atomic::AtomicModeReq::new();
+            if self.lp.is_none() {
+                // XRING O1 has no Qualcomm LP property. Clearing ACTIVE alone
+                // leaves planes and the mode still bound, and the driver
+                // refuses that commit with EINVAL; unbind the whole pipeline
+                // before turning the CRTC off.
+                for &(plane, fb_prop) in &self.planes {
+                    let props = Props::read(&self.card, plane)?;
+                    req.add_property(plane, fb_prop, property::Value::Framebuffer(None));
+                    req.add_property(plane, props.handle("CRTC_ID")?, property::Value::CRTC(None));
+                }
+                let props = Props::read(&self.card, self.conn)?;
+                req.add_property(self.conn, props.handle("CRTC_ID")?, property::Value::CRTC(None));
+                req.add_property(self.crtc, self.mode_id, property::Value::Blob(0));
+            }
             req.add_property(self.crtc, self.active, property::Value::Boolean(false));
             // Qualcomm's display driver sends no event for a commit that
             // turns its CRTC off, so this one is made to return once it is
@@ -879,6 +908,10 @@ pub mod kms {
             let mut req = atomic::AtomicModeReq::new();
             for &(plane, fb_prop) in &self.planes {
                 req.add_property(plane, fb_prop, property::Value::Framebuffer(Some(buf.fb)));
+                if self.power == Power::Off && self.lp.is_none() {
+                    let props = Props::read(&self.card, plane)?;
+                    req.add_property(plane, props.handle("CRTC_ID")?, property::Value::CRTC(Some(self.crtc)));
+                }
             }
             let mut flags = AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT;
             if self.power != Power::On {
@@ -889,6 +922,10 @@ pub mod kms {
                 }
             }
             if self.power == Power::Off {
+                if self.lp.is_none() {
+                    let props = Props::read(&self.card, self.conn)?;
+                    req.add_property(self.conn, props.handle("CRTC_ID")?, property::Value::CRTC(Some(self.crtc)));
+                }
                 req.add_property(self.crtc, self.active, property::Value::Boolean(true));
                 req.add_property(self.crtc, self.mode_id, self.preferred);
                 if let Some((id, setup)) = self.spr {

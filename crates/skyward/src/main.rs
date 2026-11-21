@@ -268,8 +268,15 @@ fn main() -> Result<()> {
         #[cfg(target_os = "android")]
         Cmd::Merge => {
             let slot = booted_slot()?;
-            let start = skyward_vab::standing(slot)? == skyward_vab::Standing::Waiting;
-            let end = merge::run(slot, start, &mut |m| println!("{m:?}"))?;
+            // The update is merged where its snapshots lie: this slot where
+            // it went to this one, and the other slot where it came from.
+            let target = skyward_vab::unmerged_target(slot)?.unwrap_or(slot);
+            if target != slot {
+                let mapped = skyward_vab::map_snapshots(target)?;
+                println!("{} snapshots of slot {} mapped", mapped.len(), target.letter());
+            }
+            let start = !matches!(skyward_vab::standing(slot)?, skyward_vab::Standing::Merging(_));
+            let end = skyward_vab::merge::follow(target, start, &mut |m| println!("{m:?}"))?;
             println!("ended {end:?}");
             Ok(())
         }
@@ -292,7 +299,7 @@ fn main() -> Result<()> {
             let services: Vec<Started> = DeviceConfig::load(&config)?.services.into_iter().filter(|s| s.runs_on(&props)).map(Started::from).collect();
             let libraries = secure::libraries()?;
             services::start(&services, libraries.as_deref())?;
-            keys::start(&keys::found(slot, libraries.as_deref())?.steps?)?;
+            keys::start(&keys::found(slot, libraries.as_deref())?.steps?, libraries.as_deref())?;
             loop {
                 std::thread::park();
             }
@@ -596,22 +603,14 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     for line in keys::describe(&steps) {
         skyward_sys::kmsg(&format!("for the phone's keys: {}", line.replace("\n  ", ", ")))?;
     }
-    keys::start(&steps)?;
+    keys::start(&steps, libraries.as_deref())?;
     agree_on_the_notes_key(&registering)
 }
 
-/// How long a file handed over may take to be there once the modules are
-/// loaded: a driver makes its files as it takes its device up, and ueventd
-/// makes the device's node once the kernel has told it of the device,
-/// either of which may come after the load of the module returns.
-#[cfg(target_os = "android")]
-const FILES_MADE: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Give each file the phone's own init hands over as it boots to the
 /// account it names, with the mode it gives, as its chown and chmod lines
-/// do. The files are the ones the modules just loaded make, which the
-/// phone's own programs open as those accounts; one not there yet is
-/// waited for.
+/// do. The files are the ones the modules just loaded made, which the
+/// phone's own programs open as those accounts.
 #[cfg(target_os = "android")]
 fn hand_over(owners: &[skyward_config::Owners]) -> Result<usize> {
     use skyward_sys::ueventd;
@@ -622,10 +621,21 @@ fn hand_over(owners: &[skyward_config::Owners]) -> Result<usize> {
     for run in owners {
         let (uid, gid) = (id(&run.user)?, id(&run.group)?);
         for path in &run.paths {
-            skyward_sys::wait_file(Path::new(path), FILES_MADE).context("wait for a file the modules just loaded make")?;
-            std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| format!("give {path} to {}:{}", run.user, run.group))?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(run.mode))
-                .with_context(|| format!("give {path} the mode {:o}", run.mode))?;
+            // A driver makes its nodes only after its module has been
+            // loaded. One that never appears is told in the kernel log and
+            // left alone: no single node may end the recovery.
+            if let Err(e) = skyward_sys::wait_file(std::path::Path::new(path), std::time::Duration::from_secs(5)) {
+                let _ = skyward_sys::kmsg(&format!("give {path}: {e:#}; going on without it"));
+                continue;
+            }
+            if let Err(e) = std::os::unix::fs::chown(path, Some(uid), Some(gid)) {
+                let _ = skyward_sys::kmsg(&format!("give {path} to {}:{}: {e:#}", run.user, run.group));
+                continue;
+            }
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(run.mode)) {
+                let _ = skyward_sys::kmsg(&format!("give {path} the mode {:o}: {e:#}", run.mode));
+                continue;
+            }
             handed += 1;
         }
     }
@@ -673,9 +683,17 @@ fn agree_on_the_notes_key(registered: &[String]) -> Result<()> {
     if names.is_empty() {
         return Ok(());
     }
-    let binder = skyward_binder::driver::Binder::open()?;
-    let agreed = skyward_crypto::sharedsecret::agree(&binder, &names)?;
-    skyward_sys::kmsg(&format!("{agreed} of the secure world agreed on the key it signs its notes with"))
+    // A secure world that does not agree on the key yet leaves the recovery
+    // usable: the keys behind a screen lock stay out of reach until it does,
+    // and every other key still works.
+    let agreed = (|| -> Result<usize> {
+        let binder = skyward_binder::driver::Binder::open()?;
+        skyward_crypto::sharedsecret::agree(&binder, &names)
+    })();
+    match agreed {
+        Ok(agreed) => skyward_sys::kmsg(&format!("{agreed} of the secure world agreed on the key it signs its notes with")),
+        Err(e) => skyward_sys::kmsg(&format!("the secure world did not agree on the key it signs its notes with: {e:#}")),
+    }
 }
 
 /// A slot of the credential service that belongs to no user, which the

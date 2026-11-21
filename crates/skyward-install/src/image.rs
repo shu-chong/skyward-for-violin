@@ -12,6 +12,11 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod protection;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use protection::ReadOnly;
+
 const BOOT_MAGIC: &[u8] = b"ANDROID!";
 const VENDOR_BOOT_MAGIC: &[u8] = b"VNDRBOOT";
 /// A dtbo image starts with this, big-endian.
@@ -202,8 +207,17 @@ pub fn partitions(kind: ImageKind, dir: &Path) -> Result<Vec<&'static str>> {
 /// of all.
 pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
     ensure!(!devices.is_empty(), "no partition to write");
+    // An OTA verifier can leave its target partitions read-only at the
+    // block layer, which makes a plain write fail with EPERM. Clear that
+    // flag for the devices we are about to write, and put it back once the
+    // write and its read-back check are done. The guards are armed before
+    // any fallible open so an error cannot leave a partition writable.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let mut flags = Vec::with_capacity(devices.len());
     let mut outs = Vec::with_capacity(devices.len());
     for path in devices {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        flags.push(ReadOnly::clear(path)?);
         let mut f = OpenOptions::new().read(true).write(true).open(path).with_context(|| format!("open {}", path.display()))?;
         let size = f.seek(SeekFrom::End(0)).with_context(|| format!("find the size of {}", path.display()))?;
         f.seek(SeekFrom::Start(0)).with_context(|| format!("rewind {}", path.display()))?;
@@ -258,6 +272,21 @@ pub fn flash<R: Read + Seek>(image: &mut R, len: u64, devices: &[PathBuf], progr
             progress(done, total);
         }
         ensure!(back.finalize() == written, "{} reads back different from what was written", path.display());
+    }
+    // Close the file descriptors before restoring the block flag: a device
+    // cannot go back to read-only while it is open for writing on Linux.
+    drop(outs);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut failed = None;
+        for flag in &mut flags {
+            if let Err(e) = flag.restore() {
+                failed.get_or_insert(e);
+            }
+        }
+        if let Some(e) = failed {
+            return Err(e);
+        }
     }
     Ok(())
 }

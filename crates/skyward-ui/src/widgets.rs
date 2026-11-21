@@ -236,10 +236,10 @@ pub fn status_bar(c: &mut Canvas, t: &Theme, f: &Fonts, bar: &Bar, ink: Rgba) {
     let cy = m.status_cy;
     // Digits carry no descender, so centre on half their height (≈0.72 em).
     c.text(&f.status, bar.clock, m.status_x, cy + m.status_px * 0.36, m.status_px, ink, None);
-    let mut right = m.w as f32 - m.status_right;
+    let mut right = c.w as f32 - m.status_right;
     if let Some((level, charging)) = bar.battery {
         if let Some(kind) = charging {
-            let x = m.w as f32 - m.status_bolt_right - m.dp(BOLT_W_DP);
+            let x = c.w as f32 - m.status_bolt_right - m.dp(BOLT_W_DP);
             let (art, ox, oy) = bolt(t, kind, x, cy);
             c.lay(&art, ox, oy, 1.0);
             right = x - m.dp(2.42);
@@ -1808,6 +1808,151 @@ pub fn progress_bar(c: &mut Canvas, t: &Theme, x: f32, y: f32, w: f32, value: f3
     let h = m.dp(6.0);
     c.fill_round_rect(x, y, w, h, h / 2.0, t.pal.track);
     c.fill_round_rect(x, y, (w * value.clamp(0.0, 1.0)).max(h), h, h / 2.0, t.pal.accent);
+}
+
+/// An install card where the package's long name gets lines of its own.
+///
+/// A version such as `17OS4.0.261112.190429467.XRPDCN.S` is far wider than
+/// a card, and `Canvas::text` truncates with an ellipsis, losing both ends.
+/// Here the short title stands alone with the timer of the job at its right
+/// end; the file the package is read from follows in green, wrapping over as
+/// many lines as it needs; the version it brings comes next, set larger than
+/// everything else and in the accent blue, with room above and below so it
+/// stands apart; the progress line and bar close the card. Returns the
+/// card's bottom.
+///
+/// Each block is placed by the ink it actually draws rather than by a
+/// baseline pitch, so the gaps are the space seen between the lines and do
+/// not grow with the type.
+pub fn progress_card_named(
+    c: &mut Canvas,
+    t: &Theme,
+    f: &Fonts,
+    top: f32,
+    title: &str,
+    name: &str,
+    package: Option<&str>,
+    detail: &str,
+    done: Option<f32>,
+    elapsed: Option<&str>,
+) -> f32 {
+    let m = &t.m;
+    let (card_x, right) = (m.margin, m.w as f32 - m.margin);
+    let x = card_x + m.inner;
+    let width = right - m.inner - x;
+
+    let (title_top, title_bot) = f.heading.ink(m.row_title_px);
+    let title_base = top + m.dp(20.0) - title_top;
+    let title_bottom = title_base + title_bot;
+    // The timer takes the title's right end, and what is left is the title's.
+    let timer = elapsed.map(|text| (text, c.text_width(&f.body, text, m.sub_px)));
+    let title_room = (width - timer.map_or(0.0, |(_, w)| w + m.dp(10.0))).max(m.dp(48.0));
+
+    // The file the package is read from, in green under the title: the whole
+    // path on one line where it fits, else the folder and the file on lines
+    // of their own.
+    let (sub_top, sub_bot) = f.body.ink(m.sub_px);
+    let file = package
+        .filter(|path| !path.is_empty())
+        .map(|path| wrap_path(c, &f.body, path, m.sub_px, width, 3));
+    let file_pitch = m.sub_px * 1.36;
+    let file_first = title_bottom + m.dp(14.0) - sub_top;
+    let file_h = file.as_ref().map_or(0.0, |lines| file_pitch * (lines.len() - 1) as f32 + (sub_bot - sub_top));
+    let file_bottom = file_first + file_h;
+
+    // The version it brings, a size above everything else on the card and in
+    // the accent blue. It keeps a wider gap than the lines do from the file
+    // above and the step below, so it reads as the card's own claim.
+    let name_px = m.row_title_px + m.dp(8.4);
+    let (name_top, name_bot) = f.heading.ink(name_px);
+    // Break the name wherever it has to, character by character, so a long
+    // unbroken version never runs past the card or gets an ellipsis.
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for ch in name.chars() {
+        let mut probe = line.clone();
+        probe.push(ch);
+        if !line.is_empty() && c.text_width(&f.heading, &probe, name_px) > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        line.push(ch);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    let lines = if lines.is_empty() { vec![name.to_string()] } else { lines };
+    let name_first = match file {
+        Some(_) => file_bottom + m.dp(18.0) - name_top,
+        None => title_bottom + m.dp(18.0) - name_top,
+    };
+    let line_h = name_px * 1.18;
+    let name_bottom = name_first + line_h * (lines.len() - 1) as f32 + name_bot;
+
+    let detail_base = name_bottom + m.dp(16.0) - sub_top;
+    let bar_top = detail_base + m.dp(13.0);
+    let bottom = match done {
+        Some(_) => bar_top + m.dp(6.0) + m.dp(16.0),
+        None => detail_base + m.dp(20.0),
+    };
+    c.fill_round_rect(card_x, top, right - card_x, bottom - top, m.card_radius, t.pal.card);
+    c.text(&f.heading, title, x, title_base, m.row_title_px, t.pal.text, Some(title_room));
+    if let Some((text, w)) = timer {
+        c.text(&f.body, text, x + width - w, title_base, m.sub_px, t.pal.subtitle, None);
+    }
+    if let Some(lines) = &file {
+        for (i, line) in lines.iter().enumerate() {
+            c.text(&f.body, line, x, file_first + file_pitch * i as f32, m.sub_px, t.pal.good, Some(width));
+        }
+    }
+    for (i, line) in lines.iter().enumerate() {
+        c.text(&f.heading, line, x, name_first + line_h * i as f32, name_px, t.pal.accent, Some(width));
+    }
+    c.text(&f.body, detail, x, detail_base, m.sub_px, t.pal.subtitle, Some(width));
+    if let Some(v) = done {
+        progress_bar(c, t, x, bar_top, width, v);
+    }
+    bottom
+}
+
+/// Break `text` to fit `width` at `px`, after a `/` where one fits, so a path
+/// breaks between its parts rather than inside a name, and anywhere else
+/// where it cannot; at most `most` lines, the last holding what is left.
+fn wrap_path(c: &Canvas, face: &Face, text: &str, px: f32, width: f32, most: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() && lines.len() + 1 < most {
+        if c.text_width(face, rest, px) <= width {
+            break;
+        }
+        // How much of what is left fits, and where the last `/` in it is.
+        let (mut cut, mut slash) = (0, 0);
+        for (i, ch) in rest.char_indices() {
+            let end = i + ch.len_utf8();
+            if c.text_width(face, &rest[..end], px) > width {
+                break;
+            }
+            cut = end;
+            if ch == '/' {
+                slash = end;
+            }
+        }
+        // A line too narrow for even one character keeps one, so the loop
+        // always moves on. A `/` at the very start of what is left is no
+        // break: it would leave a line holding the slash alone.
+        let at = if slash > 1 {
+            slash
+        } else if cut > 0 {
+            cut
+        } else {
+            rest.chars().next().map_or(1, char::len_utf8)
+        };
+        lines.push(rest[..at].to_string());
+        rest = &rest[at..];
+    }
+    if !rest.is_empty() {
+        lines.push(rest.to_string());
+    }
+    lines
 }
 
 /// A card for a long job: what is under way, a line on where it stands,

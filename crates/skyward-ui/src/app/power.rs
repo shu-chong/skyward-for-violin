@@ -30,10 +30,29 @@ impl App {
     /// dark as it is.
     pub(super) fn wake(&mut self, now: u64) {
         if !self.display_on {
+            let dark = self.screen() != Screen::Decrypt && !self.lockscreen();
             self.display_on = true;
             self.dirty = true;
             self.darkening = None;
             self.curtain.set(true, now);
+            // Once the data partition is open, waking the panel shows the
+            // swipe-to-unlock page, as TWRP and OFox do: it only keeps a
+            // pocket or a bag from pressing something, and asks for no
+            // code. It is pushed rather than opened, so the right swipe
+            // goes back to the page that was showing when the panel went
+            // dark. A wake on the lock itself leaves it there.
+            if dark && matches!(self.state.data, Data::Open | Data::Erased) {
+                self.state.confirm = 0.0;
+                // A waking panel always puts the swipe page over whatever
+                // was showing, so the swipe takes the user back there. A
+                // wake while the lock is already up leaves that one in
+                // place rather than stacking a second copy.
+                if !self.lockscreen() {
+                    self.stack.push((Screen::Lock, 0.0, Focus::Unset));
+                }
+                self.snap = true;
+                self.refresh();
+            }
         }
         self.woke_at = Some(now);
         self.stir(now);

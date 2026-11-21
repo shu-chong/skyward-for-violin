@@ -52,6 +52,18 @@ pub(super) fn refused(l: Lang, security: Security, password: &str) -> Option<&'s
 
 impl App {
     /// How the WLAN stands, as the runtime last told it.
+    /// Keep the network a join was asked for, so the next start can join it
+    /// again where the automatic switch is on. The password is plain text
+    /// on /metadata: the WLAN page says so beside its switch.
+    pub fn remember_wlan(&mut self, ssid: &[u8], name: &str, security: Security, password: &str) {
+        self.state.saved_wlan = Some(SavedWlan {
+            ssid: ssid.iter().map(|b| format!("{b:02x}")).collect(),
+            name: name.to_string(),
+            security,
+            password: password.to_string(),
+        });
+    }
+
     pub fn set_wlan(&mut self, w: Wlan) {
         if self.state.wlan.as_ref() == Some(&w) {
             return;

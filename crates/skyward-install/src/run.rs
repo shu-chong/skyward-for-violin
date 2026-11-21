@@ -19,7 +19,7 @@ use crate::{Command, Event, Failure, Options, Outcome, Reflash, Refusal, Stage, 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use skyward_sys::worker::{Teller, Worker};
 use skyward_sys::{kmsg, prop};
-use skyward_vab::{Slot, SlotMaps, SnapshotState};
+use skyward_vab::{Merge, Slot, SlotMaps, SnapshotState};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
@@ -61,6 +61,12 @@ const LINGER: Duration = Duration::from_secs(1);
 /// The most often progress is told.
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
+/// A partition OTA just wrote can refuse a write for a moment. How many
+/// times to retry a transient EPERM when writing this recovery back, and
+/// how long to wait between tries.
+const REFLASH_TRIES: usize = 4;
+const REFLASH_WAIT: Duration = Duration::from_millis(750);
+
 pub struct Installer {
     commands: Sender<Command>,
     shared: Arc<Shared>,
@@ -73,13 +79,16 @@ impl Installer {
     /// `detach` runs before an update package or an install script writes;
     /// `options` say what else the install does.
     pub fn start(detach: Detach, options: Options) -> Result<Installer> {
-        Installer::spawn(Origin::Computer, detach, options, run)
+        Installer::spawn(Origin::Computer, None, detach, options, run)
     }
 
     /// Install the file at `path`, from a thread of its own; `detach` and
     /// `options` as for [`Installer::start`].
     pub fn open(path: PathBuf, detach: Detach, options: Options) -> Result<Installer> {
-        Installer::spawn(Origin::File, detach, options, move |ctx| run_file(ctx, &path))
+        // The page names the file being installed; the computer's stream
+        // has no name, a file on the phone has.
+        let named = path.display().to_string();
+        Installer::spawn(Origin::File, Some(named), detach, options, move |ctx| run_file(ctx, &path))
     }
 
     /// Install the package the system asked for, from a thread of its own,
@@ -88,7 +97,13 @@ impl Installer {
     /// `retry` when the install started before and a restart cut it off;
     /// `detach` and `options` as for [`Installer::start`].
     pub fn asked(package: Asked, retry: bool, detach: Detach, options: Options) -> Result<Installer> {
-        Installer::spawn(Origin::Asked { retry }, detach, options, move |ctx| match &package {
+        // A package read through the map of its blocks is named by the map,
+        // which is no file the page could show.
+        let named = match &package {
+            Asked::File(path) => Some(path.display().to_string()),
+            Asked::Mapped(_) => None,
+        };
+        Installer::spawn(Origin::Asked { retry }, named, detach, options, move |ctx| match &package {
             Asked::File(path) => run_file(ctx, path),
             Asked::Mapped(map) => run_mapped(ctx, map),
         })
@@ -100,11 +115,12 @@ impl Installer {
     /// screen with [`Event::Wipe`]. The computer stays on for command after
     /// command, until it asks the phone to leave or the screen cancels.
     pub fn rescue(detach: Detach, options: Options) -> Result<Installer> {
-        Installer::spawn(Origin::Computer, detach, options, rescue)
+        Installer::spawn(Origin::Computer, None, detach, options, rescue)
     }
 
     fn spawn(
         origin: Origin,
+        path: Option<String>,
         detach: Detach,
         options: Options,
         work: impl FnOnce(&mut Context) -> Outcome + Send + 'static,
@@ -113,7 +129,7 @@ impl Installer {
         let shared = Arc::new(Shared::default());
         let theirs = shared.clone();
         let worker = Worker::start("installer", move |events| {
-            let mut ctx = Context { events, commands: command_rx, shared: theirs, detach: Some(detach), options, origin };
+            let mut ctx = Context { events, commands: command_rx, shared: theirs, detach: Some(detach), options, origin, path };
             let outcome = work(&mut ctx);
             let _ = kmsg(&format!("install: {outcome:?}"));
             ctx.send(Event::Finished(outcome));
@@ -187,6 +203,10 @@ struct Context {
     detach: Option<Detach>,
     options: Options,
     origin: Origin,
+    /// The file the package is read from, where it is one on the phone: the
+    /// page names it under the version. `None` for a package the computer
+    /// streams, which has no name at all.
+    path: Option<String>,
 }
 
 impl Context {
@@ -581,7 +601,7 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
             Ok(other) => bail!("an update waiting to be agreed to was told {other:?}"),
         }
     }
-    ctx.send(Event::Installing { version });
+    ctx.send(Event::Installing { version, path: ctx.path.clone() });
     let kept = hold(ctx, slot)?;
     installed_boot_set()?;
     detach_once(ctx)?;
@@ -601,10 +621,71 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
             if let Some(kept) = &kept {
                 reflash(ctx, kept, Ok(slot.other()));
             }
+            // The update is written to the other slot as snapshots on the
+            // data partition. Nothing else merges them before that slot
+            // starts, and its own first-stage init cannot open them: the
+            // data partition is encrypted until the system runs. Merging
+            // here, while it is open, is what makes a plain restart after
+            // the install start the new system.
+            merge_written(ctx, slot);
             Done::Decided(Outcome::Installed { slot: slot.other(), wipe })
         }
         code => Done::Engine(code),
     })
+}
+
+/// Merge the update the phone just wrote into the other slot, telling the
+/// screen how far it is. A merge that fails leaves the install as it is,
+/// and the update page says where the update stands.
+fn merge_written(ctx: &Context, current: Slot) {
+    let target = match skyward_vab::unmerged_target(current) {
+        Ok(Some(target)) => target,
+        Ok(None) => return,
+        Err(e) => {
+            let _ = kmsg(&format!("install: the update's snapshots are not read: {e:#}"));
+            return;
+        }
+    };
+    if target == current {
+        // An update applied without switching slots reads through its
+        // snapshots here; merging it is the update page's to do.
+        let _ = kmsg("install: the update went to the slot the phone runs from; it merges from the update page");
+        return;
+    }
+    let mapped = match skyward_vab::map_snapshots(target) {
+        Ok(mapped) => mapped,
+        Err(e) => {
+            let _ = kmsg(&format!("install: the update in slot {} is not mapped: {e:#}", target.letter()));
+            return;
+        }
+    };
+    if mapped.is_empty() {
+        // Written straight into the partitions, which start as they are.
+        let _ = kmsg(&format!("install: slot {} has no snapshots to merge", target.letter()));
+        return;
+    }
+    let _ = kmsg(&format!("install: {} snapshots of slot {} are mapped, merging them so the slot starts", mapped.len(), target.letter()));
+    // Merging writes the snapshots into the partitions they hold, which is
+    // irreversible for the system the slot held before; the user accepted
+    // that by installing the package.
+    let merged = skyward_vab::merge::follow(target, true, &mut |seen| {
+        if let Merge::Going(share) = seen {
+            let thousandths = (share * 1000.0).clamp(0.0, 1000.0) as u16;
+            ctx.send(Event::Progress(Stage::Merging { thousandths }));
+        }
+    });
+    match &merged {
+        Ok(Merge::Done | Merge::NeedsReboot) => {
+            let _ = kmsg(&format!("install: the update is merged into slot {}; it starts on its own", target.letter()));
+            ctx.send(Event::Progress(Stage::Merging { thousandths: 1000 }));
+        }
+        Ok(other) => {
+            let _ = kmsg(&format!("install: the update in slot {} did not merge: {other:?}", target.letter()));
+        }
+        Err(e) => {
+            let _ = kmsg(&format!("install: the update in slot {} did not merge: {e:#}", target.letter()));
+        }
+    }
 }
 
 /// This recovery, held before an install writes, when the screen asked to
@@ -614,11 +695,11 @@ fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
     if !ctx.options.keep {
         return Ok(None);
     }
-    let kept = Kept::hold(Path::new(skyward_block::BY_NAME), current).context("hold this recovery from its partition")?;
-    if kept.is_none() {
-        let _ = kmsg("install: the recovery partition does not hold Skyward, so there is none to keep");
-    }
-    Ok(kept)
+    // The user asked to flash Skyward back, so an installed Skyward must be
+    // there to copy: refuse before detaching or writing anything rather
+    // than leave another recovery in the partitions after the install.
+    let kept = Kept::hold_required(Path::new(skyward_block::BY_NAME), current).context("hold this recovery from its partition")?;
+    Ok(Some(kept))
 }
 
 /// Write this recovery back into the recovery partitions the install wrote
@@ -630,13 +711,33 @@ fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
         Ok(slots) => slots,
         Err(e) => return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}")))),
     };
-    let mut told: Option<Instant> = None;
-    let written = kept.write(&slots, &mut |done, total| {
-        if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
-            ctx.send(Event::Progress(Stage::Reflashing { done, total }));
-            told = Some(Instant::now());
+    // `image::flash` clears the block read-only flag an OTA verifier may
+    // have left on these partitions. The kernel can also hold the partition
+    // briefly after update_engine ends and refuse the write with EPERM; give
+    // it a few short tries before giving up, so a transient refusal does not
+    // leave the recovery partitions without Skyward.
+    let mut written = Ok(());
+    for attempt in 0..=REFLASH_TRIES {
+        if attempt > 0 {
+            let _ = kmsg(&format!("install: writing recovery back did not work yet ({written:?}), retry {attempt}"));
+            std::thread::sleep(REFLASH_WAIT);
         }
-    });
+        let mut told: Option<Instant> = None;
+        written = kept.write(&slots, &mut |done, total| {
+            if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+                ctx.send(Event::Progress(Stage::Reflashing { done, total }));
+                told = Some(Instant::now());
+            }
+        });
+        let transient = written.as_ref().err().is_some_and(|e| {
+            // Only EPERM is worth waiting out. Anything else (no space, a
+            // bad image, a missing device) will not fix itself.
+            format!("{e:#}").contains("Operation not permitted") || format!("{e:#}").contains("os error 1")
+        });
+        if written.is_ok() || !transient {
+            break;
+        }
+    }
     let _ = kmsg(&format!("install: this recovery written back to {slots:?}: {written:?}"));
     ctx.send(Event::Reflashed(match written {
         Ok(()) => Reflash::Written(slots),
@@ -682,7 +783,7 @@ enum Line {
 
 /// Run update_engine on the package, telling the screen how far it is,
 /// and give its exit code.
-fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
+fn apply<S>(ctx: &Context, _mount: &Mount<S>, update: &Update) -> Result<i32> {
     let (status_read, status_write) = pipe()?;
     let status_fd = status_write.as_raw_fd();
     let mut command = std::process::Command::new(ota::PROGRAM);
@@ -729,6 +830,13 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     ctx.send(Event::Progress(stage.clone()));
     let mut told = Instant::now();
     let (mut partitions, mut verifying, mut finishing, mut error) = (0, None, false, None);
+    // update_engine's own account of the bytes it has written. It is the
+    // only honest progress: the FUSE mount reads the whole payload ahead of
+    // the write, so `mount.served()` reaches `total` within a second and made
+    // the screen claim 100% while only a fraction had been written. A user
+    // who reboots at that point can leave the phone half-flashed.
+    let mut written = 0u64;
+    let mut told_real_progress = false;
     loop {
         match rx.recv_timeout(PROGRESS_EVERY) {
             Ok(Line::Status(Status::Step(step))) => finishing = step == 2,
@@ -736,6 +844,15 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
             Ok(Line::Log(Log::Partition(_))) => partitions += 1,
             Ok(Line::Log(Log::Overwriting)) => ctx.send(Event::Overwriting),
             Ok(Line::Log(Log::Hashing { index, partition })) => verifying = Some((index, partition)),
+            Ok(Line::Log(Log::Progress { done, total: size })) => {
+                // Trust the engine's denominator when it gives one; it is
+                // the payload size it was told, and the same unit as `done`.
+                written = if size == 0 { done } else { done.min(size) };
+                if !told_real_progress {
+                    told_real_progress = true;
+                    let _ = kmsg(&format!("install: progress now follows the bytes update_engine wrote, of {size}"));
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             // Both outputs closed: the program has ended.
             Err(RecvTimeoutError::Disconnected) => break,
@@ -745,7 +862,7 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
         } else if let Some((index, partition)) = &verifying {
             Stage::Verifying { index: *index, count: partitions.max(index + 1), partition: partition.clone() }
         } else {
-            Stage::Writing { done: mount.served().saturating_sub(update.payload_offset).min(total), total }
+            Stage::Writing { done: written.min(total), total }
         };
         let moved_on = std::mem::discriminant(&now) != std::mem::discriminant(&stage);
         if now != stage && (moved_on || told.elapsed() >= PROGRESS_EVERY) {

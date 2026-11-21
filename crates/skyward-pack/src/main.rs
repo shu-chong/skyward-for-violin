@@ -55,7 +55,7 @@ enum Cmd {
         /// one, skyward-system-init built for the device and linked
         /// statically.
         #[arg(long)]
-        system_init: PathBuf,
+        system_init: Option<PathBuf>,
         /// The device configuration, devices/<codename>.toml.
         #[arg(long)]
         config: PathBuf,
@@ -68,8 +68,11 @@ enum Cmd {
         /// The monospaced typeface's licence, which goes with it.
         #[arg(long)]
         mono_license: PathBuf,
+        /// Where the image goes. By default
+        /// `out/skyward-<version>-<codename>-OS<stock build>-<YYYYMMDD-HHMM>.img`,
+        /// which names the build, the device and the stock it is made on.
         #[arg(long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
     },
     /// Print the stock build a device's recovery is made on, as lines of
     /// name=value: its version, where its full update package is, and the
@@ -135,7 +138,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
             }
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
-            skyward_config::DeviceConfig::load(&config)?;
+            let cfg = skyward_config::DeviceConfig::load(&config)?;
             rd.replace(paths::RECOVERY, read(&binary)?)?;
             // Install scripts look for the commands a stock recovery lacks
             // among its programs, and its unzip there too, a link to ziptool
@@ -144,7 +147,11 @@ fn main() -> Result<()> {
             for command in paths::COMMANDS {
                 rd.link(command, recovery)?;
             }
-            rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
+            // A build without the second system carries no first program for
+            // it: leaving the file out makes that system impossible to start.
+            if let Some(system_init) = &system_init {
+                rd.add(paths::SYSTEM_INIT, 0o755, read(system_init)?)?;
+            }
             rd.add(paths::CONFIG, 0o644, read(&config)?)?;
             rd.add(paths::FONT, 0o644, read(&font)?)?;
             rd.add(paths::MONO, 0o644, read(&mono)?)?;
@@ -154,7 +161,52 @@ fn main() -> Result<()> {
             if rd.find(paths::TASK_PROFILES).is_none() {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
-            rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            // The init rules create the MTP functionfs nodes on fs. They
+            // do not bind the gadget or change sys.usb.config, so they can
+            // be present even on a build that boots with adb alone and
+            // only brings file transfer up after data is decrypted.
+            if cfg.mtp || cfg.mtp_after_decrypt {
+                rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            }
+            // XRING O1's logd needs nice=-2 for its foreground policy. init
+            // sets priority after setuid, so only RLIMIT_NICE is relaxed,
+            // not the whole SYS_NICE capability. Without this logd aborts
+            // every five seconds and floods the kernel log.
+            let logd_rc = "system/etc/init/logd.rc";
+            match rd.find(logd_rc) {
+                Some(rc) => {
+                    let text = String::from_utf8(rc.data.clone()).ok();
+                    let fixed = text.as_ref().and_then(|text| {
+                        (text.matches("    priority 10\n").count() == 1)
+                            .then(|| text.replacen("    priority 10\n", "    priority -2\n    rlimit nice 22 22\n", 1).into_bytes())
+                    });
+                    if let Some(bytes) = fixed {
+                        rd.replace(logd_rc, bytes)?;
+                    } else {
+                        // A different stock layout must not silently keep
+                        // the old priority: logd then aborts every 5 s and
+                        // floods the kernel log. Say so at build time.
+                        println!("warning: {logd_rc} did not match the expected priority line; logd may abort repeatedly");
+                    }
+                }
+                None => println!("warning: {logd_rc} is not in the ramdisk; logd fix skipped"),
+            }
+            // The shared MT6639 chip completes pre-calibration only when the
+            // BT/UART callbacks are registered; mode=2 would leave BT_open
+            // waiting on is_pre_cal_done. Keep any settings a newer stock
+            // already has rather than replacing the whole file, and skip a
+            // duplicate entry so packing a changed stock still succeeds.
+            let conninfra = "system/etc/firmware/conninfra.cfg";
+            if let Some(old) = rd.find(conninfra) {
+                let mut text = String::from_utf8_lossy(&old.data).into_owned();
+                if !text.lines().any(|line| line.trim_start().starts_with("co_clock_flag=")) {
+                    if !text.ends_with('\n') { text.push('\n'); }
+                    text.push_str("co_clock_flag=1\n");
+                    rd.replace(conninfra, text.into_bytes())?;
+                }
+            } else {
+                rd.add(conninfra, 0o644, b"co_clock_flag=1\n".to_vec())?;
+            }
             // On an unlocked device adbd keeps root when ro.secure is 0 and
             // lets any computer in without authorization when ro.adb.secure is
             // 0; init lets a later line of a property file override an earlier
@@ -167,7 +219,14 @@ fn main() -> Result<()> {
                 .data;
             let mut props = without(stock_props, &BUILD_VERSION);
             props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+            if !cfg.mtp {
+                // A later line of a property file wins, so this keeps the
+                // port on adb even where the stock ramdisk names another
+                // default. Nothing then unbinds the gadget at boot.
+                props.extend_from_slice(b"persist.sys.usb.config=adb\n");
+            }
             rd.replace(paths::PROP_DEFAULT, props)?;
+            let out = out.unwrap_or_else(|| default_image_name(&cfg, &rd));
             img.ramdisk = rd.encode()?;
             let bytes = img.to_bytes()?;
             write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
@@ -268,7 +327,39 @@ fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
 }
 
 /// Write `bytes`, the image `img` makes, to `out`.
+/// Where a build goes when no path is given: named for the Skyward it was
+/// built from, the device, the stock build it sits on, and the minute it was
+/// built — `skyward-0.3.1-violin-OS4.0.6-20261119-2220.img`.
+fn default_image_name(cfg: &skyward_config::DeviceConfig, rd: &Ramdisk) -> PathBuf {
+    // The stock build is read from the stock ramdisk itself, not from the
+    // device's configuration, so a build on a newer stock is named for it.
+    let props = rd
+        .find(paths::PROP_DEFAULT)
+        .map(|e| String::from_utf8_lossy(&e.data).into_owned())
+        .unwrap_or_default();
+    let stock = props
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ro.build.version.incremental=").map(str::trim))
+        .unwrap_or_default();
+    // `OS4.0.6.0.XOTCN` names a build `OS4.0.6`: the part that changes.
+    let stock = stock.split('.').take(3).collect::<Vec<_>>().join(".");
+    let stamp = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::system()).strftime("%Y%m%d-%H%M").to_string();
+    let mut name = format!("skyward-{}-{}", env!("CARGO_PKG_VERSION"), cfg.device.codename);
+    if !stock.is_empty() {
+        name.push('-');
+        name.push_str(&stock);
+    }
+    name.push('-');
+    name.push_str(&stamp);
+    name.push_str(".img");
+    PathBuf::from("out").join(name)
+}
+
 fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
+    // A build named by its version lands in `out/`, which need not exist yet.
+    if let Some(dir) = out.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
+    }
     std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
     println!(
         "wrote {} ({} bytes kernel, {} bytes ramdisk, {} bytes in all)",

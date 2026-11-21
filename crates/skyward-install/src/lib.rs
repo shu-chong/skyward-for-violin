@@ -85,8 +85,9 @@ pub enum Event {
     /// file on the phone, which a single tap picks.
     Ready { version: Option<String>, wipe: bool },
     /// An update package passed the checks and is being installed; the
-    /// version it brings.
-    Installing { version: Option<String> },
+    /// version it brings, and the file it is read from, where it is a file
+    /// on the phone rather than one the computer sends.
+    Installing { version: Option<String>, path: Option<String> },
     /// Super has no room to keep the running system beside the new one, so
     /// the update writes over it: until it finishes, the phone may not
     /// start.
@@ -143,6 +144,12 @@ pub enum Stage {
     Verifying { index: usize, count: usize, partition: String },
     /// It runs the package's own last steps and switches slots.
     Finishing,
+    /// The update written to the other slot is being merged into its
+    /// partitions, so that the slot starts: how far, in thousandths. The
+    /// system the update was written for cannot start before this: its
+    /// snapshots lie on the data partition, which first-stage init cannot
+    /// open.
+    Merging { thousandths: u16 },
     /// An image is written and read back: bytes so far, of all.
     Flashing { done: u64, total: u64 },
     /// The install script runs, as far as it says it is, in thousandths.

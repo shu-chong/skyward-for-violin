@@ -102,6 +102,20 @@ impl App {
         vec![Effect::Unlock { user, code }]
     }
 
+    /// The lock was answered: go back to the page the wake came over.
+    /// No code is asked for — the right swipe alone confirms.
+    pub(super) fn unlocked(&mut self) {
+        self.state.confirm = 0.0;
+        if self.stack.len() > 1 {
+            self.stack.pop();
+        } else {
+            *self.top_mut() = (Screen::Home, 0.0, Focus::Unset);
+        }
+        self.settle_page();
+        self.snap = true;
+        self.refresh();
+    }
+
     /// Add the dot under the finger to the pattern being drawn.
     pub(super) fn trace(&mut self, t: &Theme, x: f32, y: f32) {
         let Some((cx, cy, span)) = self.frame.as_ref().and_then(|fr| fr.pattern) else { return };

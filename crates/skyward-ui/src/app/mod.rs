@@ -84,6 +84,9 @@ pub use wlan::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
     Decrypt,
+    /// A swipe-to-unlock page shown when a dark panel is lit again, once
+    /// the data partition is open. It only guards against stray touches.
+    Lock,
     Home,
     Settings,
     Reboot,
@@ -125,6 +128,9 @@ pub enum Screen {
     /// system's rules give them: what it does and a swipe to start, then
     /// how far it has come and how it ended.
     Relabel,
+    /// Turning off the phone's AVB checks in the slot that starts, so a
+    /// system that would be refused can boot.
+    Avb,
     /// The partitions whose filesystems can be repaired or made afresh as
     /// another.
     Filesystems,
@@ -211,6 +217,8 @@ pub enum Confirm {
     RunScript,
     /// Merge the update that waits in the slot the phone runs from.
     Merge,
+    /// Turn off dm-verity and verification in the running slot's vbmeta.
+    DisableAvb,
     /// Give the data partition's files the SELinux labels the installed
     /// system's rules give them.
     Relabel,
@@ -223,6 +231,8 @@ pub enum Confirm {
     RemoveSystem,
     /// Install the system the installer holds with the room chosen.
     InstallSystem,
+    /// The recovery's lock screen, slid to open.
+    UnlockScreen,
 }
 
 /// What a control does when touched.
@@ -380,6 +390,9 @@ pub enum Action {
     /// Download the newest release's build for the phone and write it into
     /// the recovery partitions.
     UpdateSkyward,
+    /// Check a recovery image already on the phone and write it into the
+    /// recovery partitions.
+    UpdateSkywardFile,
     /// Stop downloading the build.
     StopSkywardUpdate,
     /// A control whose work is not wired up yet; touching it says so.
@@ -585,10 +598,16 @@ pub enum Effect {
     /// how it goes with [`App::skyward_progress`] and
     /// [`App::skyward_ended`].
     UpdateSkyward(Build),
+    /// Write the local /sdcard/Download/recovery.img into the recovery
+    /// partitions, telling how it goes the same way an online update does.
+    UpdateSkywardFile,
     StopSkywardUpdate,
     /// Merge the update that waits in the slot the phone runs from,
     /// telling how it goes with [`App::set_update`].
     Merge,
+    /// Clear the AVB flags in the running slot's vbmeta, telling the user
+    /// what happened with [`App::say`].
+    DisableAvb,
 }
 
 enum Drag {
@@ -1052,6 +1071,11 @@ fn keyboard_strip(t: &Theme, frame: &Frame) -> (Canvas, i32) {
     (strip, top)
 }
 
+/// How close together two taps on the dark screen have to be to light it.
+pub(super) const DOUBLE_TAP_MS: u64 = 400;
+/// How far apart on the glass they may land and still count as one double
+/// tap.
+pub(super) const DOUBLE_TAP_SLOP: f32 = 80.0;
 pub struct App {
     pub state: State,
     /// The pages open, the one shown last: each with how far it is
@@ -1069,6 +1093,12 @@ pub struct App {
     /// The first of the power key and volume down gone down, waiting for
     /// the other to take a screenshot, and when it went down.
     chord: Option<(Key, u64)>,
+    /// The last tap on the dark screen, and where it landed, for the second
+    /// of a double tap to light it.
+    last_tap: Option<(u64, f32, f32)>,
+    /// The page canvas size before a full-screen page (the lock) took the
+    /// whole logical canvas; put back when it leaves.
+    full: Option<(u32, u32)>,
     /// The page scrolling of its own accord, to show the control the keys
     /// moved to or to fold its search bar whole or not at all: where it
     /// comes to rest, and the spring taking it there.
@@ -1107,6 +1137,11 @@ pub struct App {
     unsaved_warned: Option<u64>,
     /// The About page field's dither, made for the screen once.
     dither: Option<glow::Dither>,
+    /// The whole-panel overlays' dither, with the size it was made for. A
+    /// tablet draws the charging screen over both panes on a canvas wider
+    /// than a page's, so it cannot share the page's dither: indexing that
+    /// one past its end would end the recovery when a cable goes in.
+    overlay_dither: Option<(u32, u32, glow::Dither)>,
     toast: Option<(String, u64)>,
     drag: Drag,
     tracker: Tracker,
@@ -1207,6 +1242,8 @@ impl App {
             keys: start == Screen::Fastboot,
             button: None,
             chord: None,
+            last_tap: None,
+            full: None,
             seek: None,
             knob: None,
             adjusting: false,
@@ -1220,6 +1257,7 @@ impl App {
             shell_folder: "/".into(),
             unsaved_warned: None,
             dither: None,
+            overlay_dither: None,
             toast: None,
             drag: Drag::Idle,
             tracker: Tracker::default(),
@@ -1268,6 +1306,46 @@ impl App {
         self.corners = radius;
     }
 
+    /// Whether the page now shown takes the whole logical canvas rather
+    /// than a tablet's detail pane: the lock screen does.
+    pub fn lockscreen(&self) -> bool {
+        self.screen() == Screen::Lock
+    }
+
+    /// Give the pages the whole logical `w` by `h` canvas while the lock
+    /// screen shows; the page's own size is kept for when it leaves.
+    pub fn set_full_screen(&mut self, w: u32, h: u32) {
+        if (self.w, self.h) == (w, h) {
+            return;
+        }
+        if self.full.is_none() {
+            self.full = Some((self.w, self.h));
+        }
+        self.change_size(w, h);
+    }
+
+    /// Put the page canvas back to the size it had before a full-screen
+    /// page, so a tablet's two-column layout comes back undisturbed.
+    pub fn restore_page_size(&mut self) {
+        let Some((w, h)) = self.full.take() else { return };
+        if (self.w, self.h) != (w, h) {
+            self.change_size(w, h);
+        }
+    }
+
+    fn change_size(&mut self, w: u32, h: u32) {
+        self.w = w;
+        self.h = h;
+        self.refresh();
+        self.cols = 0;
+        self.height = 0.0;
+        self.dither = None;
+        self.overlay_dither = None;
+        self.charge_canvas = None;
+        self.charge_art = None;
+        self.snap = true;
+    }
+
     pub fn theme(&self) -> Theme {
         if self.state.dark {
             Theme::dark(self.w, self.h, self.px_per_dp)
@@ -1278,6 +1356,51 @@ impl App {
 
     pub fn screen(&self) -> Screen {
         self.top().0
+    }
+
+    /// Whether a finger on the side column may change page. An install
+    /// that is still writing must keep its page: switching away hides its
+    /// progress and lets the result be missed. Once it has finished the
+    /// page is safe to leave, so the column works again — otherwise the
+    /// result page looks stuck with only its reboot button live.
+    pub fn navigation_open(&self) -> bool {
+        use crate::app::Install;
+        if self.screen() != Screen::Installing {
+            return true;
+        }
+        !matches!(
+            self.state.install,
+            Install::Starting
+                | Install::Opening
+                | Install::Locked(_)
+                | Install::Waiting
+                | Install::Checking { .. }
+                | Install::Choosing(_)
+                | Install::Confirming { .. }
+                | Install::ConfirmingScript
+                | Install::Updating { .. }
+                | Install::Flashing { .. }
+                | Install::Wiping
+                | Install::SystemChoosing(_)
+                | Install::Systeming { .. }
+                | Install::Scripting { .. }
+        )
+    }
+
+    /// A tablet's navigation column picked a section. Open that page as the
+    /// home page's tile would, from the root of the stack so that picking
+    /// sections in turn does not pile pages up behind the one shown.
+    pub fn select_section(&mut self, screen: Screen, _now: u64) -> Vec<Effect> {
+        if self.screen() == screen {
+            return Vec::new();
+        }
+        // A column pick changes section outright: no slide from the page
+        // left, and no page piled up behind the one now shown.
+        self.turn = None;
+        self.morph = None;
+        self.stack.truncate(1);
+        self.push(screen);
+        self.arrive_at(screen)
     }
 
     fn top(&self) -> &(Screen, f32, Focus) {
@@ -1331,7 +1454,19 @@ impl App {
         };
         let blink = self.blink_at(now).filter(|_| self.display_on).map(|(_, next)| next);
         let chord = self.chord.map(|(_, at)| at + CHORD_MS);
-        [self.toast.as_ref().map(|t| t.1), easing, self.idle_due(), held, repeat, blink, darkens, chord].into_iter().flatten().min()
+        // The decrypt page's countdown is drawn once a second, so the
+        // label really counts 3, 2, 1 rather than standing still.
+        let countdown = self.state.home_at.map(|at| at.min(now.saturating_add(1000)));
+        // The install page's timer is drawn once a second too, so the job's
+        // time really counts up while the bar stands still.
+        let ticking = self
+            .state
+            .install_at
+            .map(|at| (at + (u64::from(self.state.install_secs.unwrap_or(0)) + 1) * 1000).min(now.saturating_add(1000)));
+        [self.toast.as_ref().map(|t| t.1), easing, self.idle_due(), held, repeat, blink, darkens, chord, countdown, ticking]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Whether a text field's cursor shows at `now`, and when it next turns;
@@ -1358,6 +1493,53 @@ impl App {
     /// deadline goes away.
     pub fn tick(&mut self, now: u64) -> Vec<Effect> {
         let mut fx = Vec::new();
+        // An opened data partition takes the user home after a short pause;
+        // the decrypt page's Done key leaves at once and clears the pause.
+        if self.screen() == Screen::Decrypt && matches!(self.state.data, Data::Open | Data::Erased) {
+            if self.state.home_at.is_none() {
+                self.state.home_at = Some(now + 3_000);
+                self.state.home_left = Some(3);
+                self.dirty = true;
+            } else if let Some(at) = self.state.home_at {
+                if now >= at {
+                    self.state.home_at = None;
+                    self.state.home_left = None;
+                    fx.extend(self.select_section(Screen::Home, now));
+                } else {
+                    let left = (at.saturating_sub(now) + 999) / 1000;
+                    if self.state.home_left != Some(left as u32) {
+                        self.state.home_left = Some(left as u32);
+                        self.refresh();
+                    }
+                }
+            }
+        } else if self.state.home_at.is_some() {
+            self.state.home_at = None;
+            self.state.home_left = None;
+        }
+        // The install page counts the whole job, from the write of the
+        // package through the merge that lets the new slot start, so its
+        // label is there for the user to see how long it has been at it.
+        if matches!(self.state.install, Install::Updating { .. }) {
+            match self.state.install_at {
+                None => {
+                    self.state.install_at = Some(now);
+                    self.state.install_secs = Some(0);
+                    self.dirty = true;
+                }
+                Some(at) => {
+                    let secs = (now.saturating_sub(at) / 1000) as u32;
+                    if self.state.install_secs != Some(secs) {
+                        self.state.install_secs = Some(secs);
+                        self.refresh();
+                    }
+                }
+            }
+        } else if self.state.install_at.is_some() {
+            self.state.install_at = None;
+            self.state.install_secs = None;
+            self.dirty = true;
+        }
         // The key waiting for its partner in a screenshot, left alone long
         // enough, does what it does alone.
         if self.chord.is_some_and(|(_, at)| now >= at + CHORD_MS) {

@@ -6,10 +6,27 @@ use super::*;
 impl App {
     pub fn touch(&mut self, ev: Touch, f: &Fonts, now: u64) -> Vec<Effect> {
         // A finger on the dark panel lights nothing, as on the phone's own
-        // system, where the power key lights it.
+        // system, where the power key lights it. Where the double tap is
+        // on, two taps close in time and place do light it: only the
+        // backlight went off, so the touch controller is still listening.
         if !self.display_on {
+            if self.state.double_tap {
+                if let Touch::Down(x, y) = ev {
+                    let second = self.last_tap.is_some_and(|(at, tx, ty)| {
+                        now.saturating_sub(at) <= DOUBLE_TAP_MS && (x - tx).hypot(y - ty) <= DOUBLE_TAP_SLOP
+                    });
+                    if second {
+                        self.last_tap = None;
+                        self.wake(now);
+                        self.drag = Drag::Waking;
+                    } else {
+                        self.last_tap = Some((now, x, y));
+                    }
+                }
+            }
             return Vec::new();
         }
+        self.last_tap = None;
         // A finger on the charging screen sends it away for the page, and
         // does nothing else until it lifts.
         if self.charge_shown() {
@@ -174,7 +191,7 @@ impl App {
                     let ready = travel > m.dp(BACK_SWIPE_DP);
                     // A tap of the motor as the `<` appears, as the system
                     // gives.
-                    if ready && !armed && self.state.vibrate {
+                    if ready && !armed && self.state.vibrates() {
                         fx.push(Effect::Haptic);
                     }
                     self.drag = Drag::Edge { start, from_left, armed: ready, x, cy };
@@ -261,7 +278,7 @@ impl App {
                 Drag::Pattern => fx.extend(self.drawn(now)),
                 // Let go, the strength slider taps the motor as strongly as
                 // it was left at.
-                Drag::Slider(Slider::Vibration, _) if self.state.vibrate => fx.push(Effect::Haptic),
+                Drag::Slider(Slider::Vibration, _) if self.state.vibrates() => fx.push(Effect::Haptic),
                 _ => {}
             },
         }
@@ -378,7 +395,7 @@ impl App {
         self.stir(now);
         self.button = Some((key, Press::Spent));
         let mut fx = Vec::new();
-        if self.state.vibrate {
+        if self.state.vibrates() {
             fx.push(Effect::Haptic);
         }
         fx.push(Effect::Screenshot { storage: self.state.place_open(Place::Storage) });

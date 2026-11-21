@@ -81,7 +81,15 @@ pub fn start(programs: &[Started], libraries: Option<&Path>) -> Result<()> {
         let waiting = s.clone();
         let name = Path::new(&s.path).file_name().map_or_else(|| s.path.clone(), |n| n.to_string_lossy().into_owned());
         thread::Builder::new().name(name).spawn(move || supervise(&s, &who, &given)).context("start a supervising thread")?;
-        ready(&waiting)?;
+        // A program the configuration marks as one the recovery can do
+        // without holds up those after it as long as any other does, but one
+        // that does not come ready ends its wait with a line in the kernel
+        // log instead of ending the whole recovery service.
+        match ready(&waiting) {
+            Ok(()) => {}
+            Err(e) if waiting.optional => skyward_sys::kmsg(&format!("{e:#}; going on without it"))?,
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -89,9 +97,9 @@ pub fn start(programs: &[Started], libraries: Option<&Path>) -> Result<()> {
 /// Run `program` once to its end and give how it ended, as init runs a
 /// program one of its scripts has it run before it goes on: however the
 /// program ends, init goes on, and so may whoever asks here. It runs as
-/// [`start`] runs one, finding its libraries in the folders it names.
-pub fn once(program: &Started) -> Result<ExitStatus> {
-    let (s, who, given) = readied(program, None, &accounts())?;
+/// [`start`] runs one, with `libraries` as there.
+pub fn once(program: &Started, libraries: Option<&Path>) -> Result<ExitStatus> {
+    let (s, who, given) = readied(program, libraries, &accounts())?;
     to_its_end(&s, &who, &given)
 }
 

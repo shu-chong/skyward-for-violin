@@ -1,4 +1,4 @@
-use crate::snapshots::{self, Merge, SnapshotStatus, Snapshots};
+use crate::snapshots::{self, Merge, PartState, SnapshotStatus, Snapshots};
 use crate::{snapshot_state, MergeStatus, Slot, SnapshotState, METADATA};
 use anyhow::{ensure, Context, Result};
 use skyward_block::{devnum, dm, mount, BY_NAME};
@@ -141,8 +141,47 @@ pub fn mount_partitions(slot: Slot) -> Result<Mounts> {
     Ok(mounts)
 }
 
-/// Start merging the update into `slot`, the slot it went to and the phone
-/// runs from, its partitions mapped through their snapshots; see
+/// Map each of the slot's partitions through its snapshot, as the system's
+/// own first stage maps them, without mounting anything: the step before
+/// [`start_merge`], for an update to be merged where its system does not
+/// run, as in the recovery after a package was installed.
+/// Every snapshot of the slot is mapped, not only those a mounted slot
+/// reads through, because a merge takes them all at once. A partition
+/// update_engine left mapped is taken as it is where it is a kernel
+/// snapshot, and mapped afresh otherwise. Returns the partitions that read
+/// through a snapshot.
+pub fn map_snapshots(slot: Slot) -> Result<Vec<String>> {
+    let super_dev = super_device();
+    let md = skyward_lp::read(&super_dev, slot.number())?;
+    let devices = block_devices(&md, &super_dev)?;
+    let Some(snaps) = Snapshots::lock(true)? else { return Ok(Vec::new()) };
+    if !snaps.needed(slot)? {
+        return Ok(Vec::new());
+    }
+    let mut mapped = Vec::new();
+    for name in snaps.list()? {
+        if !name.ends_with(slot.suffix()) {
+            continue;
+        }
+        let Some(p) = md.partition(&name) else { continue };
+        let status = snaps.status(&name)?;
+        if matches!(status.part_state()?, PartState::None | PartState::MergeCompleted) {
+            continue;
+        }
+        if !snapshots::is_snapshot(&name)? {
+            // What update_engine left of it, if anything, is taken away
+            // first: the partition is mapped here whole, over its own
+            // extent and its copy-on-write space.
+            snapshots::unmap_snapshot(&name)?;
+            snapshots::map_snapshot(&snaps, &md, &devices, p, &status)?;
+        }
+        mapped.push(name);
+    }
+    Ok(mapped)
+}
+
+/// Start merging the update into `slot`, the slot it went to, its
+/// partitions mapped through their snapshots; see
 /// [`snapshots::initiate`]. `tell` tells the bootloader where the update
 /// stands.
 pub fn start_merge(slot: Slot, tell: &dyn Fn(MergeStatus) -> Result<()>) -> Result<()> {

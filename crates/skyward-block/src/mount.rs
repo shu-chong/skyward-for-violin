@@ -1,5 +1,8 @@
+#[cfg(unix)]
 use std::ffi::CString;
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -63,6 +66,7 @@ pub struct Space {
 }
 
 /// The room in the filesystem that holds `path`.
+#[cfg(unix)]
 pub fn space(path: &Path) -> io::Result<Space> {
     let s = statvfs(path)?;
     // The counts are 32 bits on some hosts and 64 on the phone.
@@ -72,6 +76,7 @@ pub fn space(path: &Path) -> io::Result<Space> {
 }
 
 /// What the kernel says of the filesystem that holds `path`.
+#[cfg(unix)]
 fn statvfs(path: &Path) -> io::Result<libc::statvfs> {
     let c = CString::new(path.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -79,6 +84,13 @@ fn statvfs(path: &Path) -> io::Result<libc::statvfs> {
         return Err(io::Error::last_os_error());
     }
     Ok(s)
+}
+
+/// A Windows host never mounts a phone's filesystems; the symbol stays so
+/// the crates that do can be built for both hosts.
+#[cfg(not(unix))]
+pub fn space(_path: &Path) -> std::io::Result<Space> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "filesystem space is available only on Unix"))
 }
 
 #[cfg(target_os = "android")]
@@ -516,6 +528,7 @@ mod tests {
         assert_eq!((flags, own.as_str()), (1, ""), "read-only, and nothing for the filesystem");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_filesystems_room_is_all_of_it_what_is_free_and_what_is_left_for_others() {
         let room = space(&std::env::temp_dir()).unwrap();

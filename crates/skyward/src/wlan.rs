@@ -340,6 +340,11 @@ impl Station {
         if let Err(e) = iface::set_up(&self.cfg.interface, false) {
             let _ = skyward_sys::kmsg(&format!("{e:#}"));
         }
+        for w in &self.cfg.off_writes {
+            if let Err(e) = std::fs::write(&w.path, &w.value) {
+                let _ = skyward_sys::kmsg(&format!("WLAN off: could not write {} to {}: {e:#}", w.value, w.path));
+            }
+        }
         self.state = Wlan::default();
     }
 
@@ -631,16 +636,39 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         for path in skyward_modules::load(modules, &cfg.modules)? {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
         }
-        for w in &cfg.writes {
-            fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
-        }
-        let until = Instant::now() + INTERFACE_WAIT;
-        while !net.exists() {
-            ensure!(Instant::now() < until, "the driver made no {} in {} seconds", cfg.interface, INTERFACE_WAIT.as_secs());
-            thread::sleep(Duration::from_millis(100));
+    }
+    // Power the chip on whether or not the interface is already there. On a
+    // shared Wi-Fi/BT chip, boot-time pre-calibration makes the interface
+    // and then powers the radio down again, leaving it present but down;
+    // gating this write on the interface being absent would skip the only
+    // step that brings the radio back up, and the supplicant would never
+    // get an answer.
+    for w in &cfg.writes {
+        fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
+    }
+    let until = Instant::now() + INTERFACE_WAIT;
+    while !net.exists() {
+        ensure!(Instant::now() < until, "the driver made no {} in {} seconds", cfg.interface, INTERFACE_WAIT.as_secs());
+        thread::sleep(Duration::from_millis(100));
+    }
+    // The interface appears before the driver has finished bringing the
+    // chip up, and setting it up meanwhile is answered EBUSY; try until
+    // the driver takes it.
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        match iface::set_up(&cfg.interface, true) {
+            Ok(()) => return Ok(()),
+            // Only EBUSY means "the driver is still coming up"; wait for
+            // that. Any other error (permission, no such device, ...) is
+            // permanent and must be reported at once, not swallowed for
+            // ten seconds and then reported as if it were a timeout.
+            Err(e) if e.downcast_ref::<std::io::Error>().and_then(|io| io.raw_os_error()) == Some(16) && Instant::now() < until => {
+                let _ = skyward_sys::kmsg(&format!("the WLAN interface is not ready yet: {e:#}"));
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => return Err(e).with_context(|| format!("bring {} up", cfg.interface)),
         }
     }
-    iface::set_up(&cfg.interface, true)
 }
 
 /// Put a file the driver asks for where the firmware loader looks.
@@ -671,7 +699,7 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     std::os::unix::fs::chown(&sockets, Some(WIFI), Some(WIFI)).with_context(|| format!("give {} to the supplicant", sockets.display()))?;
     fs::set_permissions(&sockets, fs::Permissions::from_mode(0o770)).with_context(|| format!("keep {} to the supplicant", sockets.display()))?;
     let settings = home.join("wpa_supplicant.conf");
-    fs::write(&settings, format!("ctrl_interface={}\nupdate_config=0\np2p_disabled=1\npmf=1\nsae_pwe=2\n", sockets.display()))
+    fs::write(&settings, format!("ctrl_interface={}\nupdate_config=0\np2p_disabled=1\npmf=1\nsae_pwe=2\ncountry=CN\ndisable_scan_offload=1\n", sockets.display()))
         .with_context(|| format!("write {}", settings.display()))?;
     fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).with_context(|| format!("open {} to the supplicant", settings.display()))?;
     let socket = sockets.join(&cfg.interface);

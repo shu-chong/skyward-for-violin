@@ -63,6 +63,7 @@ pub struct Band {
 pub fn render(screen: Screen, cx: &Ctx) -> Frame {
     match screen {
         Screen::Decrypt => decrypt(cx),
+        Screen::Lock => lock(cx),
         Screen::Home => home(cx),
         Screen::Settings => settings(cx),
         Screen::Reboot => reboot(cx),
@@ -85,6 +86,7 @@ pub fn render(screen: Screen, cx: &Ctx) -> Frame {
         Screen::Permissions => permissions(cx),
         Screen::Editor => editor(cx),
         Screen::Terminal => terminal(cx),
+        Screen::Avb => avb(cx),
         Screen::Relabel => relabel(cx),
         Screen::Filesystems => filesystems(cx),
         Screen::Filesystem => filesystem(cx),
@@ -134,9 +136,11 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
         Confirm::RunScript => (INSTALL, true),
         Confirm::Merge => (["滑动以合并", "滑動以合併", "Slide to merge"], true),
         Confirm::Relabel => (["滑动以修复", "滑動以修復", "Slide to fix"], true),
+        Confirm::DisableAvb => (["滑动以禁用", "滑動以停用", "Slide to disable"], true),
         Confirm::SwitchSystem => (["滑动以切换并重启", "滑動以切換並重新啟動", "Slide to switch and reboot"], false),
         Confirm::RemoveSystem => (["滑动以删除", "滑動以刪除", "Slide to remove"], true),
         Confirm::InstallSystem => (INSTALL, false),
+        Confirm::UnlockScreen => (["向右滑动解锁", "向右滑動解鎖", "Slide right to unlock"], false),
     };
     (s.lang.pick(label), danger)
 }
@@ -146,12 +150,11 @@ pub fn confirm_label(which: Confirm, s: &State) -> (&'static str, bool) {
 pub const HOME_TITLE: &str = "Skyward";
 pub const SEARCH_HINT: Text = ["搜索功能与分区", "搜尋功能與分割區", "Search features and partitions"];
 
-const REBOOT_TARGETS: [(Text, Option<Text>); 6] = [
+const REBOOT_TARGETS: [(Text, Option<Text>); 5] = [
     (["系统", "系統", "System"], None),
     (["恢复模式", "復原模式", "Recovery"], None),
     (["Fastboot"; 3], Some(["用户空间 fastbootd", "使用者空間 fastbootd", "Userspace fastbootd"])),
     (["Bootloader"; 3], None),
-    (["EDL"; 3], Some(["高通紧急下载模式", "高通緊急下載模式", "Qualcomm emergency download"])),
     (["关机", "關機", "Power off"], None),
 ];
 
@@ -316,7 +319,10 @@ pub fn home(cx: &Ctx) -> Frame {
     // However little it holds, the page scrolls far enough to fold its bar
     // away.
     let height = fitted(t, system.bottom).max(t.m.h + fold.span.ceil() as u32);
-    Frame { back: false, fold: Some(fold), ..Frame::new(t, c.crop_height(height), out, HOME_TITLE, cards_top) }
+    // A tablet keeps the wordmark in its permanent navigation column; the
+    // page under it needs no second one at its own top left.
+    let (title, header) = if cx.state.tablet { ("", false) } else { (HOME_TITLE, true) };
+    Frame { back: false, fold: Some(fold), header, ..Frame::new(t, c.crop_height(height), out, title, cards_top) }
 }
 
 /// What the home page says beside its entry to the systems: the one that
@@ -363,28 +369,40 @@ pub fn settings(cx: &Ctx) -> Frame {
     if let Some(r) = slider.below {
         out.push(Hit { rect: r, action: Action::Open(Screen::ScreenOff) });
     }
-    y = widgets::section(&mut c, t, f, slider.bottom, l.pick(["振动", "震動", "Vibration"]));
-    let below = Row::new(l.pick(["触摸振动", "觸控震動", "Touch vibration"])).trail(Trail::Switch(s.vibrate));
-    let vibration = widgets::slider_card(&mut c, t, f, y, Caption::Vibrate, l.pick(["振动强度", "震動強度", "Vibration intensity"]), s.vibration, Some(below));
-    out.push(Hit { rect: vibration.track, action: Action::Slider(Slider::Vibration) });
-    if let Some(r) = vibration.below {
-        out.push(Hit { rect: r, action: Action::Toggle(Switch::Vibrate) });
-    }
-    y = widgets::section(&mut c, t, f, vibration.bottom, l.pick(["通用", "一般", "General"]));
+    // A pad with no motor has nothing to set: leave the whole section out
+    // and keep the general section hard against the brightness slider.
+    y = if s.has_vibrator {
+        let y = widgets::section(&mut c, t, f, slider.bottom, l.pick(["振动", "震動", "Vibration"]));
+        let below = Row::new(l.pick(["触摸振动", "觸控震動", "Touch vibration"])).trail(Trail::Switch(s.vibrate));
+        let vibration = widgets::slider_card(&mut c, t, f, y, Caption::Vibrate, l.pick(["振动强度", "震動強度", "Vibration intensity"]), s.vibration, Some(below));
+        out.push(Hit { rect: vibration.track, action: Action::Slider(Slider::Vibration) });
+        if let Some(r) = vibration.below {
+            out.push(Hit { rect: r, action: Action::Toggle(Switch::Vibrate) });
+        }
+        widgets::section(&mut c, t, f, vibration.bottom, l.pick(["通用", "一般", "General"]))
+    } else {
+        widgets::section(&mut c, t, f, slider.bottom, l.pick(["通用", "一般", "General"]))
+    };
     let general = widgets::list(&mut c, t, f, y, &[
         Row::new(l.pick(LANGUAGE)).icon(BLUE, Icon::Globe).trail(Trail::Value(l.name())),
         Row::new(l.pick(TIME_ZONE)).icon(ORANGE, Icon::Clock).trail(Trail::Value(l.pick(TIME_ZONES[s.time_zone].0))),
     ]);
     out.extend(hits(&general.rows, &[Action::Open(Screen::Language), Action::Open(Screen::TimeZone)]));
-    y = widgets::section(&mut c, t, f, general.bottom, "USB");
-    let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
-    out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
-    let note = l.pick([
-        "开启后，可在电脑上管理内部存储中的文件，需先完成「解密」。",
-        "開啟後，可在電腦上管理內部儲存空間中的檔案，需先完成「解密」。",
-        "When on, a computer can manage the files in internal storage, once it is decrypted.",
-    ]);
-    y = widgets::footnote(&mut c, t, f, usb.bottom, note);
+    // A build without file transfer has no switch to offer: keep the
+    // debugging section hard against the general one.
+    if s.mtp {
+        y = widgets::section(&mut c, t, f, general.bottom, "USB");
+        let usb = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(["文件传输", "檔案傳輸", "File transfer"])).icon(BLUE, Icon::Usb).trail(Trail::Switch(s.file_transfer))]);
+        out.extend(hits(&usb.rows, &[Action::Toggle(Switch::FileTransfer)]));
+        let note = l.pick([
+            "开启后，可在电脑上管理内部存储中的文件，需先完成「解密」。",
+            "開啟後，可在電腦上管理內部儲存空間中的檔案，需先完成「解密」。",
+            "When on, a computer can manage the files in internal storage, once it is decrypted.",
+        ]);
+        y = widgets::footnote(&mut c, t, f, usb.bottom, note);
+    } else {
+        y = general.bottom;
+    }
     y = widgets::section(&mut c, t, f, y, l.pick(["调试", "偵錯", "Debugging"]));
     let debug = widgets::list(&mut c, t, f, y, &[Row::new(l.pick(TERMINAL)).icon(SLATE, Icon::Terminal)]);
     out.extend(hits(&debug.rows, &[Action::Open(Screen::Terminal)]));
@@ -401,7 +419,19 @@ pub fn settings(cx: &Ctx) -> Frame {
     }
     let about = widgets::list(&mut c, t, f, y, &rows);
     out.extend(hits(&about.rows, &opens));
-    Frame::new(t, fit(c, t, about.bottom), out, l.pick(SETTINGS), top)
+    y = widgets::section(&mut c, t, f, about.bottom, l.pick(["手势与安全", "手勢與安全", "Gestures & security"]));
+    let gesture = widgets::list(&mut c, t, f, y, &[
+        Row::new(l.pick(["双击亮屏", "雙擊亮屏", "Double tap to wake"]))
+            .icon(BLUE, Icon::Phone)
+            .subtitle(l.pick([
+                "息屏时只关背光，面板与触摸保持供电；默认关闭",
+                "息屏時只關背光，面板與觸摸保持供電；預設關閉",
+                "While dark, only the backlight goes off: the panel and touch stay powered. Off by default.",
+            ]))
+            .trail(Trail::Switch(s.double_tap)),
+    ]);
+    out.extend(hits(&gesture.rows, &[Action::Toggle(Switch::DoubleTap)]));
+    Frame::new(t, fit(c, t, gesture.bottom), out, l.pick(SETTINGS), top)
 }
 
 /// What the settings page says beside its Skyward update entry: an update
@@ -513,7 +543,7 @@ pub fn mount(cx: &Ctx) -> Frame {
 }
 
 /// Who made the recovery, as the About page names them under its version.
-const AUTHOR: &str = "© 2026 Kirk Lin";
+const AUTHOR: &str = "© 2026 Kirk Lin · @爱看小说的书虫";
 
 /// About this device, modelled on the stock「我的设备」: the wordmark, the
 /// version and its author over a moving colour field, and the summary,
@@ -668,7 +698,7 @@ pub fn specs(cx: &Ctx) -> Frame {
     let total = fmt::capacity(i.storage.total);
     let storage = match i.storage.free.map(fmt::gb) {
         Some(free) => tr!(l, "可用存储 {free} / 总存储 {total}", "可用空間 {free} / 總容量 {total}", "{free} free of {total}"),
-        None => tr!(l, "总存储 {total} · data 分区未挂载", "總容量 {total} · data 分割區未掛載", "{total} in all · data partition not mounted"),
+        None => tr!(l, "总存储 {total} · data 分区未打开", "總容量 {total} · data 分割區未開啟", "{total} in all · data partition not opened"),
     };
     y = widgets::info_card(&mut c, t, f, y + gap, &[(l.pick(["机身存储", "內建儲存空間", "Internal storage"]), storage)]);
     let links = widgets::list(&mut c, t, f, y + gap, &[
@@ -683,6 +713,47 @@ pub fn specs(cx: &Ctx) -> Frame {
 /// partition as it shows, which is how it learns each user's screen lock;
 /// a user whose files wait on one is asked with the control that lock is
 /// answered with, from the start.
+/// Words on the lock screen: it is only a guard against a stray touch,
+/// and asks for no code at all.
+const LOCK_NOTE: Text = ["向右滑动解锁", "向右滑動解鎖", "Swipe right to unlock"];
+const LOCK_TITLE: Text = ["锁屏", "鎖屏", "Lock"];
+
+/// The lock screen's background, on the whole logical canvas. The runtime
+/// gives this page the full canvas and routes every touch to it, so on a
+/// pad it covers the navigation column too, as the charging screen does.
+fn lock_sheet(cx: &Ctx) -> Canvas {
+    let (t, f, l) = (cx.t, cx.f, cx.state.lang);
+    let m = &t.m;
+    let x = m.w as f32 / 2.0;
+    let mut c = page(cx);
+    c.fill_circle(x, m.dp(210.0), m.dp(46.0), t.pal.card);
+    icons::glyph(&mut c, Icon::Lock, x, m.dp(210.0), m.dp(52.0), t.pal.accent);
+    c.text_center(&f.heading, "Skyward", x, m.dp(300.0), m.dp(36.0), t.pal.text);
+    c.text_center(&f.body, l.pick(LOCK_NOTE), x, m.dp(348.0), m.sub_px, t.pal.subtitle);
+    if let Some(b) = &cx.info.battery {
+        let charge = format!("{} {}%", l.pick(["电量", "電量", "Battery"]), b.level);
+        c.text_center(&f.body, &charge, x, m.dp(386.0), m.sub_px, t.pal.subtitle);
+    }
+    c
+}
+
+/// The recovery's lock, as TWRP and OFox have it: a swipe across the whole
+/// panel that only keeps a stray touch from pressing something. There is no
+/// code to set and no password to type after data is decrypted; the right
+/// swipe is the whole of it.
+pub fn lock(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let m = &t.m;
+    let mut c = lock_sheet(cx);
+    let label = confirm_label(Confirm::UnlockScreen, s).0;
+    let track = widgets::confirm(&mut c, t, f, m.h as f32 - m.dp(112.0), label, false, s.confirm);
+    let out = vec![Hit { rect: track, action: Action::Confirm(Confirm::UnlockScreen) }];
+    // No back arrow and no edge swipe on the swipe-only lock page: the
+    // swipe is the one way off it, so a control that does nothing has no
+    // place here.
+    Frame { header: false, back: false, ..Frame::new(t, c, out, l.pick(LOCK_TITLE), 0.0) }
+}
+
 pub fn decrypt(cx: &Ctx) -> Frame {
     let (c, l) = (page(cx), cx.state.lang);
     match &cx.state.data {
@@ -735,8 +806,16 @@ fn data_status(cx: &Ctx, mut c: Canvas, icon: Icon, title: &str, note: Option<&s
         out.push(Hit { rect: again, action: Action::OpenData });
     }
     let leave_cy = m.h as f32 - m.dp(64.0);
-    let leave = l.pick(if matches!(cx.state.data, Data::Open | Data::Erased) { ["完成", "完成", "Done"] } else { NOT_NOW });
-    c.text_center(&f.heading, leave, x, leave_cy, m.row_title_px, t.pal.accent);
+    let done = matches!(cx.state.data, Data::Open | Data::Erased);
+    let leave = l.pick(if done { ["完成", "完成", "Done"] } else { NOT_NOW });
+    let label = if done {
+        let left = cx.state.home_left.unwrap_or(3);
+        let tail = tr!(l, "{left} 秒后自动返回", "{left} 秒後自動返回", "back in {left} s");
+        format!("{} · {}", leave, tail)
+    } else {
+        leave.to_string()
+    };
+    c.text_center(&f.heading, &label, x, leave_cy, m.row_title_px, t.pal.accent);
     out.push(Hit { rect: Rect::new(x - m.dp(80.0), leave_cy - m.dp(24.0), m.dp(160.0), m.dp(48.0)), action: Action::Skip });
     Frame { header: false, ..Frame::new(t, c, out, l.pick(DECRYPT), 0.0) }
 }
@@ -996,6 +1075,11 @@ fn update_stage(l: Lang, stage: Option<&Stage>) -> (String, Option<f32>) {
             (said, Some(*index as f32 / *count as f32))
         }
         Some(Stage::Finishing) => (l.pick(["第 3 步，共 3 步：完成安装", "第 3 步，共 3 步：完成安裝", "Step 3 of 3: finishing"]).into(), None),
+        Some(Stage::Merging { thousandths }) => {
+            let s = f32::from(*thousandths) / 1000.0;
+            let p = percent(s);
+            (tr!(l, "正在合并更新 {p}%", "正在合併更新 {p}%", "Merging the update {p}%"), Some(s))
+        }
         Some(Stage::Reflashing { done, total }) => (l.pick(REFLASHING).into(), Some(*done as f32 / *total as f32)),
         Some(Stage::Flashing { .. } | Stage::Script { .. } | Stage::Signature { .. } | Stage::Allocating { .. } | Stage::Root { .. } | Stage::Storing) | None => {
             (l.pick(GETTING_READY).into(), None)
@@ -1056,8 +1140,22 @@ fn reflashed(c: &mut Canvas, cx: &Ctx, y: f32) -> f32 {
             widgets::footnote(c, t, f, y, &said)
         }
         Some(Reflash::Failed(why)) => {
-            let note = l.pick(["未能将 Skyward 重新刷入 recovery 分区。", "無法將 Skyward 重新刷入 recovery 分割區。", "Couldn't flash Skyward back into the recovery partitions."]);
+            // The system itself did install — this only says Skyward could
+            // not write itself back. Tell the user plainly that the system
+            // is fine and how to get Skyward back, so the message is not
+            // mistaken for a failed flash and does not prompt a re-flash.
+            let note = l.pick([
+                "系统已安装成功；Skyward 未能重新刷入 recovery 分区，不影响开机。",
+                "系統已安裝成功；Skyward 未能重新刷入 recovery 分割區，不影響開機。",
+                "The system installed fine. Skyward could not write itself back into recovery; booting is unaffected.",
+            ]);
             let y = widgets::footnote(c, t, f, y, note);
+            let hint = l.pick([
+                "如需再进 Skyward，请用 fastboot flash recovery_b <镜像> 单独刷入。",
+                "如需再進 Skyward，請用 fastboot flash recovery_b <鏡像> 單獨刷入。",
+                "To get Skyward back, flash it separately: fastboot flash recovery_b <image>.",
+            ]);
+            let y = widgets::footnote(c, t, f, y, hint);
             widgets::footnote(c, t, f, y, why)
         }
     }
@@ -1280,19 +1378,44 @@ pub fn installing(cx: &Ctx) -> Frame {
             let note = l.pick(["返回将取消安装，不会写入任何内容。", "返回將取消安裝，不會寫入任何內容。", "Going back cancels the install without writing anything."]);
             widgets::footnote(&mut c, t, f, track.y + track.h, note)
         }
-        Install::Updating { version, stage, overwriting } => {
-            let title = match version {
-                Some(v) => tr!(l, "正在安装 {v}", "正在安裝 {v}", "Installing {v}"),
-                None => l.pick(["正在安装系统更新", "正在安裝系統更新", "Installing the system update"]).into(),
-            };
+        Install::Updating { version, path, stage, overwriting } => {
+            // "Installing" stands on its own line, and the package's long
+            // version gets as many wrapped lines as it needs below it. Long
+            // names used to be cut at both ends by the single-line title.
+            let title = l.pick(["正在安装", "正在安裝", "Installing"]);
+            let name: &str = version.as_deref().unwrap_or_else(|| l.pick(["系统更新", "系統更新", "system update"]));
             let (detail, done) = update_stage(l, stage.as_ref());
-            let y = widgets::progress_card(&mut c, t, f, top, &title, &detail, done);
+            // How long the job has been at it, counted by the app once a
+            // second and set at the title's right end.
+            let timer = s.install_secs.map(|secs| {
+                let (mm, ss) = (secs / 60, secs % 60);
+                tr!(l, "用时：{mm:02}:{ss:02}", "用時：{mm:02}:{ss:02}", "Elapsed {mm:02}:{ss:02}")
+            });
+            let y = widgets::progress_card_named(&mut c, t, f, top, title, name, path.as_deref(), &detail, done, timer.as_deref());
             let until = until_installed(l, s.source);
             let note = match i.slot.map(|s| s.other().letter()) {
                 Some(slot) => tr!(l, "{until}新系统将安装到槽位 {slot}。", "{until}新系統將安裝到槽位 {slot}。", "{until} The new system installs to slot {slot}."),
                 None => until.to_string(),
             };
             let y = widgets::footnote(&mut c, t, f, y, &note);
+            // An official package takes several minutes. Spelling that out
+            // keeps a stalled-looking progress bar from being mistaken for
+            // a finished install and rebooted into a half-written system.
+            // The merge that follows the write is a step of its own, and
+            // the restart has to wait for it.
+            let patience = match stage {
+                Some(Stage::Merging { .. }) => l.pick([
+                    "正在把更新合并到新系统的分区，约需几分钟。合并完成前请勿重启或断电，否则新系统无法启动。",
+                    "正在把更新合併到新系統的分割區，約需幾分鐘。合併完成前請勿重新啟動或斷電，否則新系統無法啟動。",
+                    "Merging the update into the new system's partitions takes a few minutes. Do not reboot or cut power before it finishes, or the new system will not start.",
+                ]),
+                _ => l.pick([
+                    "安装官方包约需 5 分钟，进度长时间不动属正常。显示安装成功前，请勿重启或断电，否则可能无法开机。",
+                    "安裝官方套件約需 5 分鐘，進度長時間不動屬正常。顯示安裝成功前，請勿重新啟動或斷電，否則可能無法開機。",
+                    "An official package takes about 5 minutes, so a progress bar that hardly moves is normal. Do not reboot or cut power until it says the install succeeded, or the phone may not start.",
+                ]),
+            };
+            let y = widgets::footnote(&mut c, t, f, y, patience);
             if *overwriting {
                 let note = l.pick([
                     "正在覆盖当前系统，安装完成前重启将无法进入系统。",
@@ -1484,17 +1607,77 @@ fn finished(
     match outcome {
         Outcome::Installed { slot, .. } => {
             let slot = slot.letter();
-            let detail = tr!(
-                l,
-                "新系统已安装到槽位 {slot}，重启后将从该槽位启动。",
-                "新系統已安裝到槽位 {slot}，重新啟動後將從該槽位啟動。",
-                "The new system is installed to slot {slot}, which starts after a reboot."
-            );
-            let y = widgets::list(c, t, f, top, &[standing(installed, GREEN, Icon::Install, &detail)]).bottom;
-            let next = widgets::list(c, t, f, y + gap, &[restart]);
-            out.extend(hits(&next.rows, &[Action::RebootTo(Target::System)]));
-            let y = reflashed(c, cx, next.bottom);
-            afterwards_of(c, cx, y, true)
+            // The install wrote the update; the merge that lets that slot
+            // start is done here, before this page. Where it did not
+            // finish, the page must not offer a restart that starts no
+            // system: say what is left, and go to where it is done.
+            let unmerged = !cx.state.update.starts();
+            let (title, color) = match unmerged {
+                true => (l.pick(["安装成功，待合并更新", "安裝成功，待合併更新", "Installed, with the update left to merge"]), ORANGE),
+                false => (installed, GREEN),
+            };
+            let detail = match unmerged {
+                true => tr!(
+                    l,
+                    "新系统已写入槽位 {slot}，但尚未合并；合并完成前重启将无法进入系统。",
+                    "新系統已寫入槽位 {slot}，但尚未合併；合併完成前重新啟動將無法進入系統。",
+                    "The new system is written to slot {slot} but not merged; a restart before it merges starts no system."
+                ),
+                false => tr!(
+                    l,
+                    "新系统已安装到槽位 {slot}，重启后将从该槽位启动。",
+                    "新系統已安裝到槽位 {slot}，重新啟動後將從該槽位啟動。",
+                    "The new system is installed to slot {slot}, which starts after a reboot."
+                ),
+            };
+            let y = widgets::list(c, t, f, top, &[standing(title, color, Icon::Install, &detail)]).bottom;
+            let next = match unmerged {
+                true => {
+                    let merge = Row::new(l.pick(["合并更新", "合併更新", "Merge the update"])).icon(ORANGE, Icon::Layers);
+                    let list = widgets::list(c, t, f, y + gap, &[merge]);
+                    out.extend(hits(&list.rows, &[Action::Open(Screen::Update)]));
+                    list
+                }
+                false => {
+                    let list = widgets::list(c, t, f, y + gap, &[restart]);
+                    out.extend(hits(&list.rows, &[Action::RebootTo(Target::System)]));
+                    list
+                }
+            };
+            // An update whose snapshots are served by snapuserd is the
+            // system's own to merge once it runs. One Skyward left
+            // unmerged is merged under Advanced > System update.
+            let y = match cx.state.update {
+                Standing::Compressed => {
+                    let note = l.pick([
+                        "这类更新由新系统在首次启动后自己完成合并，请勿在启动完成前强制重启。若反复停在开机界面，请回到恢复模式，在「高级 > 系统更新」中查看。",
+                        "這類更新由新系統在首次啟動後自行完成合併，請勿在啟動完成前強制重新啟動。若反覆停在開機畫面，請回到復原模式，在「進階 > 系統更新」中查看。",
+                        "An update of this kind merges in the new system once it starts, so don't force a restart before it comes up. If the phone keeps looping at the startup screen, return to recovery and look under Advanced > System update.",
+                    ]);
+                    widgets::footnote(c, t, f, next.bottom, note)
+                }
+                Standing::Installed(_) | Standing::Waiting => {
+                    let note = l.pick([
+                        "更新尚未合并到槽位。新系统在合并完成前无法启动，请先在「高级 > 系统更新」中合并。",
+                        "更新尚未合併到槽位。新系統在合併完成前無法啟動，請先在「進階 > 系統更新」中合併。",
+                        "The update is not merged into its slot yet, and the new system does not start before it is. Merge it under Advanced > System update first.",
+                    ]);
+                    widgets::footnote(c, t, f, next.bottom, note)
+                }
+                Standing::Failed(_) => {
+                    let note = l.pick([
+                        "更新未能合并。请在「高级 > 系统更新」中重新合并，成功后再重启；合并失败时重启通常无法进入系统。",
+                        "更新未能合併。請在「進階 > 系統更新」中重新合併，成功後再重新啟動；合併失敗時重新啟動通常無法進入系統。",
+                        "The update did not merge. Merge it again under Advanced > System update and restart once it succeeds; after a failed merge a restart usually starts no system.",
+                    ]);
+                    widgets::footnote(c, t, f, next.bottom, note)
+                }
+                _ => next.bottom,
+            };
+            let y = reflashed(c, cx, y);
+            // A package the system asked for has the phone leave on its
+            // own — but not into a slot whose update is not merged.
+            afterwards_of(c, cx, y, !unmerged)
         }
         Outcome::Flashed { partition, slots } => {
             let slots = fmt::slots(l, slots);
@@ -2208,6 +2391,7 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Row::new(l.pick(FILESYSTEMS)).icon(RED, Icon::Mount),
         Row::new(l.pick(LOGS)).icon(ORANGE, Icon::Log),
         Row::new(l.pick(UPDATE)).icon(GREEN, Icon::Layers).trail(Trail::Value(update_value(cx))),
+        Row::new(l.pick(DISABLE_AVB)).icon(RED, Icon::Shield),
     ]);
     let out = hits(&tools.rows, &[
         Action::Open(Screen::Files),
@@ -2216,13 +2400,43 @@ pub fn advanced(cx: &Ctx) -> Frame {
         Action::Open(Screen::Filesystems),
         Action::Open(Screen::Logs),
         Action::Open(Screen::Update),
+        Action::Open(Screen::Avb),
     ]);
     Frame::new(t, c, out, l.pick(ADVANCED), top)
 }
 
 const RELABEL: Text = ["修复 SELinux 上下文", "修復 SELinux 上下文", "Fix SELinux contexts"];
+const DISABLE_AVB: Text = ["禁用 AVB 验证", "停用 AVB 驗證", "Disable AVB verification"];
 const FILESYSTEMS: Text = ["文件系统", "檔案系統", "Filesystems"];
 const STOPPED: Text = ["已停止", "已停止", "Stopped"];
+
+/// Turning off the phone's verified boot in the slot that starts: the
+/// dm-verity check of each block and the bootloader's check of the
+/// partitions. Some systems cannot start until both are off. There is no
+/// switch back here — restoring them needs a stock vbmeta flashed again.
+pub fn avb(cx: &Ctx) -> Frame {
+    let (t, f, s, l) = (cx.t, cx.f, cx.state, cx.state.lang);
+    let mut c = page(cx);
+    let mut out = Vec::new();
+    let top = t.m.content_top;
+    let title = l.pick(DISABLE_AVB);
+    let what = l.pick([
+        "关闭当前启动槽位 vbmeta 中的两项校验：dm-verity 和 bootloader 启动校验。若系统卡在开机界面，关闭后通常可以正常启动。",
+        "關閉目前啟動槽位 vbmeta 中的兩項校驗：dm-verity 與 bootloader 啟動校驗。若系統卡在開機畫面，關閉後通常可以正常啟動。",
+        "Turns off both checks in the running slot's vbmeta: dm-verity and the bootloader's verification. A system that loops at the startup screen usually starts once they are off.",
+    ]);
+    let mut y = widgets::paragraph(&mut c, t, f, top, what);
+    let warn = l.pick([
+        "这会改动启动验证，仅对解锁的 bootloader 有效；本页不提供恢复，恢复需重新刷入官方 vbmeta。改完需重启生效。",
+        "這會改動啟動驗證，僅對解鎖的 bootloader 有效；本頁不提供恢復，恢復需重新刷入官方 vbmeta。改完需重新啟動生效。",
+        "This changes boot verification and works only with an unlocked bootloader. There is no undo here: restoring it needs a stock vbmeta flashed again. Restart for the change to take effect.",
+    ]);
+    y = widgets::footnote(&mut c, t, f, y, warn);
+    let (label, danger) = confirm_label(Confirm::DisableAvb, s);
+    let track = widgets::confirm(&mut c, t, f, y + t.m.dp(24.0), label, danger, s.confirm);
+    out.push(Hit { rect: track, action: Action::Confirm(Confirm::DisableAvb) });
+    Frame::new(t, c, out, title, top)
+}
 const STOPPING: Text = ["正在停止", "正在停止", "Stopping"];
 
 /// Giving the data partition's files the SELinux labels the installed
@@ -2591,7 +2805,11 @@ pub fn update(cx: &Ctx) -> Frame {
     let merging = l.pick(["更新合并", "更新合併", "Merging"]);
     y = if y == top { widgets::section_first(&mut c, t, f, y, merging) } else { widgets::section(&mut c, t, f, y, merging) };
     y = widgets::list(&mut c, t, f, y, &[row]).bottom;
-    if s.update == Standing::Waiting {
+    // An update the slot the phone runs from reads through is merged here;
+    // one written to the other slot too, which the recovery does after an
+    // install and again here where that did not finish. Both are the same
+    // merge, and both are irreversible.
+    if matches!(s.update, Standing::Waiting | Standing::Installed(_) | Standing::Failed(_)) {
         let (label, danger) = confirm_label(Confirm::Merge, cx.state);
         let track = widgets::confirm(&mut c, t, f, y + t.m.dp(28.0), label, danger, s.confirm);
         out.push(Hit { rect: track, action: Action::Confirm(Confirm::Merge) });
@@ -2736,6 +2954,14 @@ pub fn skyward_update(cx: &Ctx) -> Frame {
     let y = widgets::info_card(&mut c, t, f, y, &[(l.pick(["当前版本", "目前版本", "Current version"]), VERSION.to_string())]);
     let y = widgets::section(&mut c, t, f, y, l.pick(["在线更新", "線上更新", "Online update"]));
     let y = skyward_online(&mut c, cx, y, &mut out);
+    let y = widgets::section(&mut c, t, f, y, l.pick(["本地更新", "本機更新", "Local update"]));
+    let local = widgets::list(&mut c, t, f, y, &[
+        Row::new(l.pick(["从本地 recovery.img 更新", "從本機 recovery.img 更新", "Update from local recovery.img"]))
+            .icon(BLUE, Icon::Usb)
+            .subtitle(l.pick(["把镜像放到 /sdcard/Download/recovery.img", "把鏡像放到 /sdcard/Download/recovery.img", "Put the image at /sdcard/Download/recovery.img"])),
+    ]);
+    out.extend(hits(&local.rows, &[Action::UpdateSkywardFile]));
+    let y = local.bottom;
     let points = [
         l.pick([
             "新版本从 GitHub 下载，校验 SHA-256 后写入 recovery 分区，不会改动系统和用户数据。",
@@ -2882,7 +3108,31 @@ pub fn wlan(cx: &Ctx) -> Frame {
     let on = !matches!(w.power, Power::Off | Power::Failed(_));
     let switch = widgets::list(&mut c, t, f, top, &[Row::new(l.pick(WLAN)).trail(Trail::Switch(on))]);
     out.extend(hits(&switch.rows, &[Action::Toggle(Switch::Wlan)]));
-    let mut y = switch.bottom;
+    // Joining the network kept from the last start is off by default: it
+    // brings WLAN up at boot, and its password is kept as plain text on
+    // /metadata, which this recovery's root adb can read.
+    let auto_note = match &s.saved_wlan {
+        Some(w) => format!(
+            "{} {} · {}",
+            l.pick(["已保存", "已儲存", "Saved"]),
+            w.name,
+            l.pick(["密码明文保存", "密碼明文保存", "password kept as plain text"])
+        ),
+        None => l
+            .pick([
+                "连接一个网络后会记住它；密码以明文保存在 /metadata，默认关闭",
+                "連線一個網路後會記住它；密碼以明文保存在 /metadata，預設關閉",
+                "A network is remembered once joined. Its password is kept as plain text on /metadata; off by default.",
+            ])
+            .to_string(),
+    };
+    let auto = widgets::list(&mut c, t, f, switch.bottom + t.m.card_gap, &[
+        Row::new(l.pick(["开机自动连接", "開機自動連線", "Connect on start"]))
+            .subtitle(auto_note.as_str())
+            .trail(Trail::Switch(s.wlan_auto)),
+    ]);
+    out.extend(hits(&auto.rows, &[Action::Toggle(Switch::WlanAuto)]));
+    let mut y = auto.bottom;
     match &w.power {
         Power::Off => {
             let note = l.pick([

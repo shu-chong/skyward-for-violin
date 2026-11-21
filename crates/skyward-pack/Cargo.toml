@@ -13,6 +13,8 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { version = "4.5.51", features = ["derive"] }
 hex = { workspace = true }
+# Names a build for the minute it was made, in the device's own time zone.
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tzdb-bundle-always", "tz-system"] }
 # Reads the filesystem of a partition where it lies in a package, through
 # whatever gives it the partition's bytes.
 rust-fs-core = "0.4.4"

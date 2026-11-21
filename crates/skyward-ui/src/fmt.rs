@@ -417,24 +417,28 @@ pub fn update(l: Lang, s: &Standing, next: Option<Slot>) -> (&'static str, Optio
         ),
         Standing::Installed(installed) => {
             let slot = installed.letter();
+            // Nothing merges this update by itself: the slot it went to
+            // cannot start before its snapshots are merged into it, and
+            // first-stage init cannot open them where they lie. Say where
+            // it stands, and that merging here is what lets it start.
             let detail = match next {
                 Some(next) if next == *installed => tr!(
                     l,
-                    "重启后将从槽位 {slot} 启动新系统，启动后自动合并",
-                    "重新啟動後將從槽位 {slot} 啟動新系統，啟動後自動合併",
-                    "After a reboot the new system starts from slot {slot}, and merges once it has started"
+                    "新系统已写入槽位 {slot}，尚未合并；合并后重启即进入新系统",
+                    "新系統已寫入槽位 {slot}，尚未合併；合併後重新啟動即進入新系統",
+                    "The new system is written to slot {slot} and not merged yet; merge it, then a reboot starts it"
                 ),
                 Some(_) => tr!(
                     l,
-                    "需在系统的「系统更新」中重启，才会从槽位 {slot} 启动新系统",
-                    "需在系統的「系統更新」中重新啟動，才會從槽位 {slot} 啟動新系統",
-                    "Reboot from the system's System update to start slot {slot}'s new system"
+                    "新系统已写入槽位 {slot}，尚未合并；下次启动仍是另一个槽位",
+                    "新系統已寫入槽位 {slot}，尚未合併；下次啟動仍是另一個槽位",
+                    "The new system is written to slot {slot} and not merged yet; the next start is still the other slot"
                 ),
                 None => tr!(
                     l,
-                    "从槽位 {slot} 启动新系统后将自动合并",
-                    "從槽位 {slot} 啟動新系統後將自動合併",
-                    "Merges once slot {slot}'s new system starts"
+                    "新系统已写入槽位 {slot}，尚未合并；合并后重启即进入新系统",
+                    "新系統已寫入槽位 {slot}，尚未合併；合併後重新啟動即進入新系統",
+                    "The new system is written to slot {slot} and not merged yet; merge it, then a reboot starts it"
                 ),
             };
             (l.pick(["更新已安装", "更新已安裝", "Update installed"]), Some(detail))
@@ -448,9 +452,13 @@ pub fn update(l: Lang, s: &Standing, next: Option<Slot>) -> (&'static str, Optio
             line(["此类更新需在系统中合并，启动系统后将自动合并", "這類更新需在系統中合併，啟動系統後將自動合併", "An update of this kind merges in the system, once it starts"]),
         ),
         Standing::Merging(_) => (l.pick(["正在合并更新", "正在合併更新", "Merging the update"]), None),
-        Standing::Failed(code) => (
+        Standing::Failed(_) => (
             l.pick(["更新合并失败", "更新合併失敗", "The update failed to merge"]),
-            Some(tr!(l, "重启后将继续合并（{code:?}）", "重新啟動後將繼續合併（{code:?}）", "Merging goes on after a reboot ({code:?})")),
+            line([
+                "合并完成前重启将无法进入系统；请在此重新合并",
+                "合併完成前重新啟動將無法進入系統；請在此重新合併",
+                "A restart before it merges starts no system; merge it again here",
+            ]),
         ),
         Standing::Merged => (
             l.pick(["更新已合并", "更新已合併", "Update merged"]),
@@ -475,7 +483,9 @@ pub fn update_value(l: Lang, s: &Standing) -> &'static str {
 
 pub fn data(l: Lang, d: &Data) -> &'static str {
     l.pick(match d {
-        Data::Closed | Data::Opening | Data::Failed(_) => ["未挂载", "未掛載", "Not mounted"],
+        Data::Closed => ["未解密", "未解密", "Not decrypted"],
+        Data::Opening => ["正在解密", "正在解密", "Decrypting"],
+        Data::Failed(_) => ["未打开", "未開啟", "Not opened"],
         Data::Locked { .. } => ["未解密", "未解密", "Locked"],
         Data::Open => ["已解密", "已解密", "Decrypted"],
         Data::Erased => ["已清除", "已清除", "Wiped"],
@@ -1833,14 +1843,17 @@ mod tests {
     #[test]
     fn an_installed_update_says_whether_its_slot_starts_next() {
         let installed = Standing::Installed(Slot::A);
-        assert_eq!(update(HANS, &installed, Some(Slot::A)).1.unwrap(), "重启后将从槽位 A 启动新系统，启动后自动合并");
+        assert_eq!(update(HANS, &installed, Some(Slot::A)).1.unwrap(), "新系统已写入槽位 A，尚未合并；合并后重启即进入新系统");
         assert_eq!(
             update(HANS, &installed, Some(Slot::B)).1.unwrap(),
-            "需在系统的「系统更新」中重启，才会从槽位 A 启动新系统",
+            "新系统已写入槽位 A，尚未合并；下次启动仍是另一个槽位",
             "the system's updater has not had slot A start next yet"
         );
-        assert_eq!(update(HANS, &installed, None).1.unwrap(), "从槽位 A 启动新系统后将自动合并", "the boot control could not tell");
-        assert_eq!(update(Lang::En, &installed, Some(Slot::A)).1.unwrap(), "After a reboot the new system starts from slot A, and merges once it has started");
+        assert_eq!(update(HANS, &installed, None).1.unwrap(), "新系统已写入槽位 A，尚未合并；合并后重启即进入新系统", "the boot control could not tell");
+        assert_eq!(
+            update(Lang::En, &installed, Some(Slot::A)).1.unwrap(),
+            "The new system is written to slot A and not merged yet; merge it, then a reboot starts it"
+        );
     }
 
     #[test]

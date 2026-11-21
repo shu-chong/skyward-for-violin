@@ -20,6 +20,27 @@ pub struct State {
     /// place in [`TIME_ZONES`].
     pub time_zone: usize,
     pub vibrate: bool,
+    /// Whether the device has a motor at all. A pad without one shows no
+    /// vibration setting.
+    pub has_vibrator: bool,
+    /// Whether the pages are laid out in two columns with a permanent
+    /// navigation column, which already carries the wordmark.
+    pub tablet: bool,
+    /// Whether this build offers file transfer over USB at all.
+    pub mtp: bool,
+    /// When the decrypt page takes the user home by itself after the data
+    /// partition opened. None until it has, and once its Done key is used.
+    pub home_at: Option<u64>,
+    /// The whole seconds left on that pause, so its label counts down.
+    pub home_left: Option<u32>,
+    /// A finger on the dark panel lights it on a double tap. Off by
+    /// default: keeping the panel and the touch awake costs power, and the
+    /// pad's own rest path is known good.
+    pub double_tap: bool,
+    /// The WLAN joins the network it last joined as the recovery starts.
+    pub wlan_auto: bool,
+    /// That network, and the password it was joined with.
+    pub saved_wlan: Option<SavedWlan>,
     /// How strongly the motor taps, from 0 at the slider's left end to 1
     /// at its right.
     pub vibration: f32,
@@ -37,6 +58,12 @@ pub struct State {
     /// How far the swipe-to-confirm knob is dragged, 0 to 1.
     pub confirm: f32,
     pub install: Install,
+    /// When the install under way began, on the clock the app keeps in
+    /// milliseconds; none while none runs. The install page counts from it.
+    pub install_at: Option<u64>,
+    /// How long that install has run, in whole seconds, so its label counts
+    /// without a clock of its own.
+    pub install_secs: Option<u32>,
     /// Where the package being installed comes from.
     pub source: Source,
     /// The name of the file being installed, when it is one on the phone.
@@ -183,6 +210,14 @@ pub struct State {
     pub traffic: Traffic,
 }
 
+impl State {
+    /// Whether a tap of the motor is wanted: the device has one, and the
+    /// user has left its switch on.
+    pub fn vibrates(&self) -> bool {
+        self.has_vibrator && self.vibrate
+    }
+}
+
 impl Default for State {
     fn default() -> Self {
         State {
@@ -194,6 +229,14 @@ impl Default for State {
             screen_off: 3,
             time_zone: 0,
             vibrate: true,
+            has_vibrator: true,
+            tablet: false,
+            mtp: true,
+            home_at: None,
+            home_left: None,
+            double_tap: false,
+            wlan_auto: false,
+            saved_wlan: None,
             vibration: SLIDER_START,
             file_transfer: true,
             reboot: 0,
@@ -203,6 +246,8 @@ impl Default for State {
             pattern: Vec::new(),
             confirm: 0.0,
             install: Install::Idle,
+            install_at: None,
+            install_secs: None,
             source: Source::Computer,
             package_name: None,
             script_output: Vec::new(),
@@ -349,5 +394,27 @@ impl State {
             Screen::Systems => self.dual_boot,
             _ => true,
         }
+    }
+}
+
+/// The WLAN network the recovery last joined, and joins again as it starts
+/// when its switch says so. The SSID is kept as hex, as the supplicant is
+/// told it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedWlan {
+    pub ssid: String,
+    pub name: String,
+    pub security: Security,
+    pub password: String,
+}
+
+impl SavedWlan {
+    /// The SSID as the supplicant is told it.
+    pub fn ssid_bytes(&self) -> Vec<u8> {
+        self.ssid
+            .as_bytes()
+            .chunks_exact(2)
+            .filter_map(|pair| std::str::from_utf8(pair).ok().and_then(|text| u8::from_str_radix(text, 16).ok()))
+            .collect()
     }
 }

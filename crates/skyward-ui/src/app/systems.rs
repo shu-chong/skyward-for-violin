@@ -123,7 +123,11 @@ mod tests {
         assert_eq!(app.screen(), Screen::Advanced);
         app.set_update(Standing::Installed(Slot::A));
         tap(&mut app, &f, &i, Action::Open(Screen::Update));
-        assert!(app.frame(&f, &i).hits.is_empty(), "an update in the other slot merges once that slot has started");
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::Merge),
+            vec![Effect::Merge],
+            "an update written to the other slot is merged from here too, as the recovery does after an install"
+        );
     }
 
     #[test]

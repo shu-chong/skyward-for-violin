@@ -44,6 +44,14 @@ pub fn set(config: &str, timeout: Duration) -> Result<()> {
 /// serving it and takes every function off; init then sets the port up
 /// once the programs behind the new configuration are ready.
 pub fn switch(config: &str, timeout: Duration) -> Result<()> {
+    // Taking the port through "none" unbinds the whole gadget, and a
+    // Windows host then has to enumerate the composite device again. If it
+    // already offers exactly this configuration, there is nothing to
+    // switch: a build that keeps adb alone must stay on it through every
+    // rest and wake.
+    if prop("sys.usb.state").as_deref() == Some(config) {
+        return Ok(());
+    }
     set("none", timeout)?;
     set(config, timeout)
 }

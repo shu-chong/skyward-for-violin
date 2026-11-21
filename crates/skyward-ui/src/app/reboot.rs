@@ -10,11 +10,13 @@ pub enum Target {
     Recovery,
     Fastboot,
     Bootloader,
-    Edl,
     PowerOff,
 }
 
-pub const TARGETS: [Target; 6] = [Target::System, Target::Recovery, Target::Fastboot, Target::Bootloader, Target::Edl, Target::PowerOff];
+/// EDL is Qualcomm's emergency download mode; the XRING O1 pad has no such
+/// mode, so this build leaves it out of the list entirely. Keep TARGETS and
+/// pages::REBOOT_TARGETS in step.
+pub const TARGETS: [Target; 5] = [Target::System, Target::Recovery, Target::Fastboot, Target::Bootloader, Target::PowerOff];
 
 /// Where the fastboot page goes, in the order it lists them: the volume
 /// keys move between them and the power key takes one.

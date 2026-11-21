@@ -1,0 +1,231 @@
+# Xiaomi Pad 7S Pro 12.5 (violin), XRING O1, HyperOS 4.0.5.0
+#
+# Built on Skyward v0.3.1. WLAN follows the same XRING O1 port's MT6639
+# chain (Lw5959/dijun_skyward): the whole chain is brought up at boot in
+# one continuous order, and only the final power-on write is left to the
+# WLAN page. No second system; the image carries no skyward/system-init.
+
+# Keep adb as the only USB function at boot: the MTP gadget rebind at ~15 s
+# made Windows lose the ADB interface. The MTP init rules are still packed
+# (they only create the functionfs nodes), and file transfer comes up by
+# itself once the data partition has been decrypted, where the rebind is
+# expected and adb can be brought back with `adb kill-server`.
+mtp = false
+mtp_after_decrypt = true
+
+[device]
+codename = "violin"
+brand = "Xiaomi"
+model = "Xiaomi Pad 7S Pro 12.5"
+ab = true
+soc = { hans = "玄戒®O1 移动平台", hant = "玄戒®O1 行動平台", en = "XRING® O1 Mobile Platform" }
+os_version_prop = "ro.mi.os.version.incremental"
+# No vibration motor on this pad: keep the vibration setting off the page.
+supports_vibration = false
+
+[display]
+# persist.sys.miui_resolution in the odm partition's build.prop: 2136,3200,400.
+width = 2136
+height = 3200
+density = 400
+diagonal = 12.5
+corner_radius = 60
+# The panel offers 30, 48, 50, 60, 90, 120 and 144 Hz at its own size.
+# 144 Hz underflowed the DPU (903 times in one session) and tore the
+# picture: the display controller the recovery brings up votes no DDR
+# bandwidth, so the memory stayed at its slowest. Holding the memory
+# controller's fastest rate as a floor (crates/skyward-sys/dvfs.rs) fixed
+# 120 Hz — zero underflows, no torn frame — but not 144 Hz: that one still
+# underflows with DDR pinned, because the DPU core clock the recovery gets
+# is 483.33 MHz, and 144 Hz needs 1.0355 Gpx/s of scan-out (about 2.14
+# pixels per clock) against a ceiling near 2. 120 Hz needs 0.913 Gpx/s
+# (1.89), which fits. See docs/REVIEW-144hz-failure-2026-11-19.md.
+refresh = 120
+# The panel scans out 3200x2136 (landscape), but the pad is held portrait.
+# Pages are laid out on a 2136x3200 logical canvas and turned 90 degrees
+# counter-clockwise onto the framebuffer. 90 was verified upside down on
+# the device; 270 is its mirror. Touch follows the same turn in reverse,
+# so the axis mapping needs no change when this is flipped.
+rotate = 270
+# A permanent navigation column beside the pages, as a tablet's UI has.
+# 0 keeps the phone's single column; the change needs only a repack.
+columns = 560
+
+[modules]
+sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
+# Everything the WLAN chain needs is loaded at boot, in one continuous
+# order, as the stock init.conninfra.rc / init.wlan_drv.rc and
+# vendor_dlkm/modules.load do. rfkill comes first (wlan_drv resolves
+# rfkill_* symbols from it). Loading these only after the user opens the
+# WLAN page leaves a ~50 s gap in which pre-calibration never completes.
+load = [
+    "rfkill",
+    "conninfra",
+    # MT6639 is one Wi-Fi/BT chip. Pre-calibration is coordinated through
+    # callbacks both subsystems register with conninfra: without the BT
+    # driver connv3_core_subsys_ops_reg reports bt=[NULL][NULL], the
+    # pre-cal flow never starts and wlan_func_on_by_chrdev times out.
+    # These five are what the same-O1 dijun port loads. The BT driver's own
+    # btmtk_connv3_sub_drv_init registers the pre-cal callbacks with
+    # conninfra at module load, so no BlueZ/BlueALSA userspace stack and no
+    # Bluetooth UI is needed just to let WLAN power on.
+    "bluetooth",
+    "hci_uart",
+    "hidp",
+    "rfcomm",
+    "btmtk_uart_unify",
+    "wmt_chrdev_wifi_connac3",
+    "wlan_drv_gen4m_eap_6639",
+    "nt_touch",
+    "fts_touch_spi",
+    "xiaomi_touch_violin",
+    "nt36532_tc_touch_violin",
+]
+
+# The controller sends raw frames, which Xiaomi's touch feature service
+# turns into touches from /odm/lib64/libtouchreport.so. The panel lies
+# across the screen: measured by tapping the bottom-right corner, which
+# the panel reports as x~100, y~3060, so the screen's y is mirrored.
+# Deliberately no timed rewrite of touch.writes: on NT36536 that triggers
+# nvt_xm_htc_set_idle_baseline_update once a second and breaks a held
+# finger / swipe. The same-O1 dijun port does not use it either.
+[touch]
+writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "1" }]
+reversed = ["y"]
+
+# ---- MT6639 connsys boot chain (before anything opens the WLAN page) ----
+
+# Initialise the connectivity subsystem. The stock init_conninfra.rc runs
+# this right after loading conninfra.ko, at post-fs-data.
+[[service]]
+path = "/vendor/bin/conninfra_loader"
+libraries = ["/system/lib64", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
+oneshot = true
+user = "root"
+groups = ["root"]
+
+# wlan_assistant waits for this property to read the calibration data;
+# without it the chip never leaves pre-calibration.
+[[service]]
+path = "/system/bin/setprop"
+args = ["vendor.mtk.nvram.ready", "1"]
+oneshot = true
+
+# The UART/BT callbacks must be registered before the user powers WLAN on:
+# MT6639 is a shared chip and pre-calibration is coordinated through BT.
+# co_clock_flag=1 in system/etc/firmware/conninfra.cfg (added by the packer)
+# keeps the stock mode instead of forcing mode 2, which would leave BT_open
+# waiting on is_pre_cal_done forever.
+[[service]]
+path = "/vendor/bin/uart_launcher"
+args = ["-f", "3", "-p", "/dev/ttyXR0"]
+libraries = ["/system/lib64", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
+user = "root"
+groups = ["root"]
+
+# Reads the NVRAM calibration from the read-only nvdata mount and serves it
+# to the driver. Marked optional: a failure here must not end the recovery.
+[[service]]
+path = "/vendor/bin/wlan_assistant"
+libraries = ["/system/lib64", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
+optional = true
+user = "root"
+groups = ["root"]
+
+# ---- touch and secure world (as in the verified 60 Hz build) ----
+
+[[service]]
+path = "/odm/bin/hw/vendor.xiaomi.hw.touchfeature-service"
+libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64"]
+ready_service = "vendor.xiaomi.hw.touchfeature.ITouchFeature/default"
+optional = true
+user = "root"
+groups = ["root"]
+
+[[service]]
+path = "/vendor/bin/tee-supplicant"
+libraries = ["/system/lib64", "/vendor/lib64"]
+user = "root"
+groups = ["root"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.security.keymint@3.0-service.mitee"
+libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
+ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
+registers = [
+    "android.hardware.security.keymint.IRemotelyProvisionedComponent/default",
+    "android.hardware.security.secureclock.ISecureClock/default",
+    "android.hardware.security.sharedsecret.ISharedSecret/default",
+]
+optional = true
+user = "root"
+groups = ["root"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper-service.mitee"
+libraries = ["/system/lib64", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
+ready_service = "android.hardware.gatekeeper.IGatekeeper/default"
+optional = true
+user = "root"
+groups = ["root"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.boot-service.xring"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.hardware.boot.IBootControl/default"
+optional = true
+user = "root"
+groups = ["root"]
+
+# nvdata holds the WLAN/BT NVRAM. The fstab rewrite in the recovery mounts
+# persist and nvdata ro,noload and never formats /data or /metadata.
+# Intentionally no [[owners]] for the BT nodes: hand_over() chowns each
+# path and skips a missing one with a log (it no longer fails hard), while /dev/stpbt and the
+# /proc/stpbt entries appear only after btmtk_uart_unify has probed (and
+# procfs often refuses chown). Every service here runs as root and SELinux
+# is permissive, so no ownership changes are needed for them to be opened.
+
+[partitions]
+mounted = ["persist", "nvdata"]
+
+[logd]
+libraries = ["/mnt/system/system/lib64/libsysutils.so", "/mnt/system/system/lib64/libcap.so"]
+
+# The driver modules are already up from [modules].load; only the final
+# power-on / power-off writes remain for the WLAN page.
+[wlan]
+modules = []
+writes = [{ path = "/dev/wmtWifi", value = "1\n" }]
+off_writes = [{ path = "/dev/wmtWifi", value = "0\n" }]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/system/lib64", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
+service = "android.hardware.wifi.supplicant.ISupplicant/default"
+probe = "http://connect.rom.miui.com/generate_204"
+
+[update]
+server = "https://update.miui.com/updates/miotaV3.php"
+
+[stock]
+version = "OS4.0.5.0.XOTCNXM"
+package = "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS4.0.5.0.XOTCNXM/violin-ota_full-OS4.0.5.0.XOTCNXM-user-17.0-7f96a43945.zip"
+recovery = "376631cfc1988048a1bb32579d5611c5bc8a66c3246c74e5a98b6c9ac4730293"
+
+[backup]
+efs = ["nvram", "proinfo", "protect_f", "protect_s", "nvdata", "nvcfg", "persist"]
+data_skipped = ["vendor/mitee", "vendor/misc/mi_fp", "vendor/fingerprint"]
+
+[wipe]
+logs = ["/data/miuilog", "/data/vendor/log", "/data/vendor/tombstones", "/data/vendor/wlan_logs"]
+
+# Not written:
+# - [haptics]. The pad has no vibration motor.
+# - [firmware]. WLAN firmware is in /vendor/firmware where the driver looks.
+# - A second system. No skyward/system-init in the image; the Systems page,
+#   its worker and the fastboot boot-set path are unreachable.
+# - A Bluetooth *UI* / audio stack. The kernel BT driver from dijun's
+#   module list is loaded above for WLAN pre-calibration, but the BlueZ /
+#   BlueALSA runtime in .references/bluetooth-runtime is not bundled: no
+#   pairing page, no A2DP. That remains a separate piece of work.
+# - Rotation is configurable: flip `rotate` between 90 and 270 (or set
+#   `columns = 0` for a single column) and repack; no rebuild is needed.

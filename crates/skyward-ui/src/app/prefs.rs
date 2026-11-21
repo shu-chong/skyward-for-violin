@@ -27,8 +27,12 @@ pub enum Switch {
     /// over.
     KeepRecovery,
     Wlan,
+    /// Join the network last joined as the recovery starts.
+    WlanAuto,
     /// Show the password typed rather than a dot for each character.
     ShowPassword,
+    /// Light the screen again on a double tap while it is off.
+    DoubleTap,
 }
 
 /// How long the screen stays on with nothing touched, in milliseconds, in

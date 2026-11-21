@@ -46,6 +46,10 @@ pub enum Log {
     Overwriting,
     /// It started reading back the `index`th partition it wrote, from 0.
     Hashing { index: usize, partition: String },
+    /// Bytes of the payload it has actually written, of all. This is the
+    /// real progress: the FUSE mount serves the whole package in a moment,
+    /// so how much was read from it says nothing about what was written.
+    Progress { done: u64, total: u64 },
 }
 
 pub fn log(line: &str) -> Option<Log> {
@@ -55,6 +59,16 @@ pub fn log(line: &str) -> Option<Log> {
     }
     if line.contains("Will overwrite existing partitions.") {
         return Some(Log::Overwriting);
+    }
+    // delta_performer.cc(108) writes, for example:
+    //   Completed 2022/5180 operations (39%), 3336273920/8770311080 bytes downloaded (38%), overall progress 38%
+    // The bytes before " bytes downloaded" are the real write progress.
+    if let Some(at) = line.find(" bytes downloaded")
+        && let Some((_, pair)) = line[..at].rsplit_once(", ")
+        && let Some((done, total)) = pair.split_once('/')
+        && let (Ok(done), Ok(total)) = (done.parse(), total.parse())
+    {
+        return Some(Log::Progress { done, total });
     }
     let rest = after(line, "Hashing partition ")?;
     let (index, rest) = rest.split_once(" (")?;
@@ -158,6 +172,17 @@ mod tests {
             Some(Log::Overwriting)
         );
         assert_eq!(log("[INFO:delta_performer.cc(267)] PartitionInfo old odm sha256: 00 size: 4"), None);
+        assert_eq!(log("[INFO:delta_performer.cc(108)] Completed 10/400 operations (2%)"), None);
+    }
+
+    #[test]
+    fn the_bytes_the_engine_wrote_give_honest_progress() {
+        assert_eq!(
+            log("[INFO:delta_performer.cc(108)] Completed 2022/5180 operations (39%), 3336273920/8770311080 bytes downloaded (38%), overall progress 38%"),
+            Some(Log::Progress { done: 3_336_273_920, total: 8_770_311_080 })
+        );
+        // A line with no "bytes downloaded" is not progress, even when it
+        // mentions operations.
         assert_eq!(log("[INFO:delta_performer.cc(108)] Completed 10/400 operations (2%)"), None);
     }
 

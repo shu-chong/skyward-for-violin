@@ -5,10 +5,11 @@
 //! a time zone, a part or a place by its name, so a later version that lists
 //! them otherwise reads them the same.
 
-use crate::app::{Place, State, SCREEN_OFF, TIME_ZONES};
+use crate::app::{Place, SavedWlan, State, SCREEN_OFF, TIME_ZONES};
 use crate::Lang;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use skyward_net::supplicant::Security;
 
 /// How long settings stand unchanged before they are written, so a slider
 /// dragged across the page is written once, after the hand stops.
@@ -49,9 +50,60 @@ pub struct Settings {
     pub vibration: f32,
     /// A computer connected over USB is offered internal storage.
     pub file_transfer: bool,
+    /// A finger on the dark panel lights it on a double tap. Off by
+    /// default on a pad whose panel and touch both rest with the backlight.
+    pub double_tap: bool,
+    /// The WLAN network joined last, that a later start may join again.
+    pub wlan: Wlan,
     pub install: Install,
     pub backup: Backup,
     pub logs: Logs,
+}
+
+/// The WLAN network the recovery last joined, and whether it joins it again
+/// as it starts. The SSID is kept as hex, as the supplicant is told it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Wlan {
+    pub auto: bool,
+    pub ssid: String,
+    pub name: String,
+    pub security: String,
+    pub password: String,
+}
+
+impl Default for Wlan {
+    fn default() -> Self {
+        Wlan { auto: false, ssid: String::new(), name: String::new(), security: String::new(), password: String::new() }
+    }
+}
+
+impl Wlan {
+    /// The kind of protection the kept network asked for.
+    pub fn security(&self) -> Security {
+        match self.security.as_str() {
+            "open" => Security::Open,
+            "owe" => Security::Owe,
+            "wep" => Security::Wep,
+            "psk" => Security::Psk,
+            "sae" => Security::Sae,
+            "psk_sae" => Security::PskSae,
+            "enterprise" => Security::Enterprise,
+            _ => Security::PskSae,
+        }
+    }
+
+    pub fn security_name(security: Security) -> &'static str {
+        match security {
+            Security::Open => "open",
+            Security::Owe => "owe",
+            Security::Wep => "wep",
+            Security::Psk => "psk",
+            Security::Sae => "sae",
+            Security::PskSae => "psk_sae",
+            Security::Enterprise => "enterprise",
+        }
+    }
 }
 
 /// The install page's options.
@@ -126,6 +178,14 @@ impl Settings {
             vibrate: state.vibrate,
             vibration: state.vibration,
             file_transfer: state.file_transfer,
+            double_tap: state.double_tap,
+            wlan: Wlan {
+                auto: state.wlan_auto,
+                ssid: state.saved_wlan.as_ref().map_or_else(String::new, |w| w.ssid.clone()),
+                name: state.saved_wlan.as_ref().map_or_else(String::new, |w| w.name.clone()),
+                security: state.saved_wlan.as_ref().map_or_else(String::new, |w| Wlan::security_name(w.security).to_string()),
+                password: state.saved_wlan.as_ref().map_or_else(String::new, |w| w.password.clone()),
+            },
             install: Install { check_signature: state.check_signature, keep_recovery: state.keep_recovery },
             backup: Backup {
                 parts: names(&state.backup, &PARTS),
@@ -184,6 +244,16 @@ impl Settings {
             state.vibration = self.vibration;
         }
         state.file_transfer = self.file_transfer;
+        state.double_tap = self.double_tap;
+        state.wlan_auto = self.wlan.auto;
+        if !self.wlan.ssid.is_empty() {
+            state.saved_wlan = Some(SavedWlan {
+                ssid: self.wlan.ssid.clone(),
+                name: self.wlan.name.clone(),
+                security: self.wlan.security(),
+                password: self.wlan.password.clone(),
+            });
+        }
         state.check_signature = self.install.check_signature;
         state.keep_recovery = self.install.keep_recovery;
         state.backup = picked(&self.backup.parts, &PARTS);
@@ -247,8 +317,12 @@ impl Keeper {
     pub fn new(kept: &Kept) -> Keeper {
         let holds = match kept {
             Kept::Settings(settings) => Some(Some(settings.clone())),
-            Kept::Nothing => Some(None),
-            Kept::Unreadable => None,
+            // An unreadable file means the pages already show defaults
+            // (take_settings was given no settings). Treat that like "no
+            // file yet": allow the defaults to be written once they settle,
+            // instead of never writing for the whole session and leaving a
+            // damaged or empty file untouched even after /metadata recovers.
+            Kept::Nothing | Kept::Unreadable => Some(None),
         };
         Keeper { holds, standing: None }
     }

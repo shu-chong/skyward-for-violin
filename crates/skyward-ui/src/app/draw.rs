@@ -165,9 +165,34 @@ impl App {
     /// while a cable has just gone in, both as dark as the content stands
     /// as the panel goes off or comes up.
     pub fn compose(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
+        self.compose_pages(out, f, info, clock, now);
+        self.compose_overlays(out, f, info, clock, now);
+    }
+
+    /// Only the pages. A tablet draws these into its detail pane, then puts
+    /// the whole-panel overlays over the whole logical canvas so that the
+    /// navigation column dims and shows charging with the page.
+    pub fn compose_pages(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
         let charge = self.charging.as_ref().map_or(0.0, |c| c.shown.level(now));
         if charge < 1.0 {
             self.compose_page(out, f, info, clock, now);
+        }
+    }
+
+    /// The charging screen and the curtain that dims the panel as it goes
+    /// off. Both cover the whole panel, not just a tablet's detail pane.
+    pub fn compose_overlays(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64) {
+        let charge = self.charging.as_ref().map_or(0.0, |c| c.shown.level(now));
+        if charge < 1.0 {
+            // The status bar belongs to the whole panel, not to a tablet's
+            // detail pane: its clock stands at the very left of the logical
+            // canvas, its battery at the very right.
+            let t = if self.state.dark {
+                Theme::dark(out.w, out.h, self.px_per_dp)
+            } else {
+                Theme::light(out.w, out.h, self.px_per_dp)
+            };
+            widgets::status_bar(out, &t, f, &self.bar(clock, info), t.pal.status);
         }
         if charge > 0.0 {
             self.compose_charging(out, f, info, charge, now);
@@ -177,18 +202,47 @@ impl App {
 
     /// The charging screen, `level` of the way over the page drawn on `out`.
     fn compose_charging(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, level: f32, now: u64) {
-        let battery = info.battery.as_ref().expect("a cable went in on a phone whose battery is read");
-        let (t, lang) = (self.theme(), self.state.lang);
+        // A cable can go in before the battery has been read. There is
+        // nothing to draw until it has, and a missing reading must never
+        // end the recovery.
+        let Some(battery) = info.battery.as_ref() else {
+            return;
+        };
+        let lang = self.state.lang;
+        // The overlay belongs to the canvas it is drawn on, which on a
+        // tablet is the whole logical canvas rather than the narrow page.
+        let t = if self.state.dark {
+            Theme::dark(out.w, out.h, self.px_per_dp)
+        } else {
+            Theme::light(out.w, out.h, self.px_per_dp)
+        };
+        // Its dither is kept apart from the page's, and remade whenever the
+        // canvas it covers changes size; the two are drawn at different
+        // widths on a tablet, and sharing one indexes past its end.
+        if self.overlay_dither.as_ref().is_none_or(|(w, h, _)| (*w, *h) != (out.w, out.h)) {
+            self.overlay_dither = Some((out.w, out.h, glow::Dither::new(out.w as usize, out.h as usize)));
+            self.charge_art = None;
+            self.charge_canvas = None;
+        }
         if !self.charge_art.as_ref().is_some_and(|a| a.shows(lang, battery)) {
-            self.charge_art = Some(charge::Art::new(f, &t.m, lang, battery).expect("the screens' face takes the charging screen's weight"));
+            match charge::Art::new(f, &t.m, lang, battery) {
+                Ok(art) => self.charge_art = Some(art),
+                Err(e) => {
+                    eprintln!("charging screen: {e:#}; keeping the page");
+                    return;
+                }
+            }
+        }
+        if level < 1.0 && self.charge_canvas.as_ref().is_none_or(|c| (c.w, c.h) != (out.w, out.h)) {
+            self.charge_canvas = Some(Canvas::new(out.w, out.h));
         }
         let since = self.charging.as_ref().map_or(now, |c| c.since);
-        let dither = self.dither.get_or_insert_with(|| glow::Dither::new(out.w as usize, out.h as usize));
-        let art = self.charge_art.as_ref().expect("drawn above");
+        let dither = &self.overlay_dither.as_ref().expect("made above").2;
+        let art = self.charge_art.as_ref().expect("made above");
         if level >= 1.0 {
             charge::draw(out, art, &t.m, battery.level, now.saturating_sub(since), dither);
         } else {
-            let screen = self.charge_canvas.get_or_insert_with(|| Canvas::new(out.w, out.h));
+            let screen = self.charge_canvas.as_mut().expect("made above");
             charge::draw(screen, art, &t.m, battery.level, now.saturating_sub(since), dither);
             out.lay(screen, 0, 0, level);
         }
@@ -319,7 +373,6 @@ impl App {
         }
         self.shown = Some(view);
 
-        widgets::status_bar(out, &t, f, &self.bar(clock, info), t.pal.status);
         if let Some((text, _)) = &self.toast {
             widgets::toast(out, &t, f, text);
         }
@@ -535,7 +588,7 @@ impl App {
 
     /// Draw the search bar on its way between the home page and the search
     /// page; see [`Morph`].
-    fn compose_morph(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, clock: &str, now: u64, caret_on: bool) {
+    fn compose_morph(&mut self, out: &mut Canvas, f: &Fonts, info: &DeviceInfo, _clock: &str, now: u64, caret_on: bool) {
         let t = self.theme();
         let m = t.m;
         let mut morph = self.morph.take().expect("composing it");
@@ -569,7 +622,7 @@ impl App {
             let below = m.content_top + m.search_h;
             out.put_rows(&frame.canvas, below.floor() as i32, frame.canvas.h as i32, (below - morph.scroll + rise).floor() as i32);
         }
-        let title = morph.title.get_or_insert_with(|| Blurs::new(widgets::big_title(&t, f, pages::HOME_TITLE)));
+        let title = morph.title.get_or_insert_with(|| Blurs::new(widgets::big_title(&t, f, frame.title)));
         let level = (1.0 - q / MORPH_TITLE_GONE).clamp(0.0, 1.0);
         draw_faded(out, title, 0.0, rise - morph.scroll, t.pal.text, level, (1.0 - level) * m.dp(TITLE_BLUR_DP));
         if let Some((keys, top)) = &morph.keyboard {
@@ -589,7 +642,6 @@ impl App {
         draw_faded(out, disc, 0.0, 0.0, t.pal.search, shown, blur);
         draw_faded(out, cross, 0.0, 0.0, t.pal.text, shown, blur);
         self.morph = Some(morph);
-        widgets::status_bar(out, &t, f, &self.bar(clock, info), t.pal.status);
         if let Some((text, _)) = &self.toast {
             widgets::toast(out, &t, f, text);
         }

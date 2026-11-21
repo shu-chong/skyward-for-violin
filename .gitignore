@@ -15,3 +15,9 @@ NOTES.md
 TODO.md
 *.draft.md
 notes/
+
+# local port artifacts
+.references/
+out/
+tools/
+logs/

@@ -211,7 +211,7 @@ impl App {
         self.state.file = Some(entry);
         self.state.asking_delete = false;
         self.open(Screen::FileInfo);
-        if self.state.vibrate {
+        if self.state.vibrates() {
             vec![Effect::Haptic]
         } else {
             Vec::new()

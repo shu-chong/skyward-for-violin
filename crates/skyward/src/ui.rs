@@ -41,6 +41,7 @@ use skyward_ui::app::{
     INSTALL_UNFINISHED, USB_DRIVE,
 };
 use skyward_ui::settings::Keeper;
+use skyward_ui::tablet::{self, Rotation, Tablet};
 use skyward_ui::surface::kms::KmsSurface;
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
 use skyward_vab::{Merge, Standing};
@@ -149,7 +150,11 @@ const NORMAL_MAX: [(&str, &str); 3] = [
 /// display driver booted with gives that maximum in the device tree.
 fn normal_max(max: u32) -> Result<u32> {
     let param = "/sys/module/msm_drm/parameters/dsi_display0";
-    let boot = fs::read_to_string(param).with_context(|| format!("read {param}"))?;
+    // msm_drm is Qualcomm's display driver; on a platform without it there
+    // is no separate high-brightness-mode headroom to take off.
+    let Ok(boot) = fs::read_to_string(param) else {
+        return Ok(max);
+    };
     // The panel's node, then its configuration after a colon, as in
     // "qcom,mdss_dsi_m1_42_02_0a_dsc_cmd:"; the driver takes no name
     // without the colon either.
@@ -184,7 +189,6 @@ fn power(target: Target) -> Result<()> {
         Target::Recovery => Power::Recovery,
         Target::Fastboot => Power::Fastboot,
         Target::Bootloader => Power::Bootloader,
-        Target::Edl => Power::Edl,
         Target::PowerOff => Power::Off,
     })
 }
@@ -256,6 +260,17 @@ fn withhold(transfer: &mut Option<Transfer>, app: &mut App, now: u64) -> Result<
 fn fastboot_status() -> Result<(bool, UsbLink)> {
     let running = skyward_sys::prop("init.svc.fastbootd").as_deref() == Some("running");
     Ok((running, usb_link()?))
+}
+
+/// Whether the display refused a modeset for a reason that may pass once
+/// its driver has finished recovering, rather than for a configuration it
+/// cannot use. A DRM master the process that has just gone away still
+/// holds, or a panel in exception recovery, answers EACCES to the first
+/// commit and takes the next one.
+fn momentary_commit_failure(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| matches!(io.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::InvalidInput))
 }
 
 /// Light the panel, as on a cable going in or out, when the battery as it
@@ -1026,8 +1041,17 @@ fn installed(cfg: &DeviceConfig, info: &skyward_info::DeviceInfo) -> Result<Inst
     let slot = info.slot.context("only an A/B phone is updated")?;
     let props = skyward_info::installed_props(slot)?;
     let prop = |name: &str| props.get(name).cloned().with_context(|| format!("the installed system says no {name}"));
+    // Some official packages (for example OS4.0.6.0 on violin) no longer
+    // set ro.product.mod_device. The update server only needs the device
+    // name, with no region suffix for a Chinese build, so fall back to
+    // ro.product.device rather than refuse to check for updates at all.
+    let device = props
+        .get("ro.product.mod_device")
+        .cloned()
+        .or_else(|| props.get("ro.product.device").cloned())
+        .with_context(|| "the installed system says no ro.product.mod_device or ro.product.device")?;
     Ok(Installed {
-        device: prop("ro.product.mod_device")?,
+        device,
         version: prop(&cfg.device.os_version_prop)?,
         android: prop("ro.build.version.release")?,
         unlocked: skyward_block::boot_param("androidboot.flash.locked")?.as_deref() == Some("0"),
@@ -1118,8 +1142,11 @@ struct Pages<'a> {
     unread: Untaken,
     fonts: Fonts,
     surface: KmsSurface,
-    /// The frame last drawn.
+    /// The frame last drawn, in the panel's own coordinates.
     screen: Canvas,
+    /// A pad's portrait canvas, its navigation column and the turn onto the
+    /// panel. Pages are composed into `tablet.detail`.
+    tablet: Tablet,
     inputs: Inputs,
     started: Instant,
     /// Whether the wait for a touch panel to come up is over.
@@ -1238,8 +1265,45 @@ impl<'a> Pages<'a> {
         untaken(&mut unread.battery, "the battery", battery.as_ref().err())?;
         let info = skyward_info::collect_with(cfg, battery.unwrap_or_default())?;
         let fonts = Fonts::load(font, 0, mono)?;
-        let mut surface = KmsSurface::open("/dev/dri/card0")?;
+        // A panel scanned out above 90 Hz reads the frame buffer faster than
+        // a memory controller left to itself delivers it: the display
+        // controller brought up here has no vendor services behind it and
+        // votes no bandwidth of its own, so the kernel log shows `ddr 0 MB/s`
+        // at the lowest clock profile. The memory controller's fastest rate
+        // is held as the floor before the panel comes up, so its first frames
+        // are fed; one that refuses is told to and the panel is driven anyway.
+        if cfg.display.refresh.is_some_and(|hz| hz > 90) {
+            if let Err(e) = skyward_sys::dvfs::hold_memory_fast() {
+                let _ = skyward_sys::kmsg(&format!("display: the memory controller keeps its own rate ({e:#})"));
+            }
+        }
+        // Ending here would restart the whole recovery service and lose the
+        // decrypted data, the touch panel and the network with it. A
+        // momentary refusal of the first modeset is worth a short wait.
+        let mut surface = None;
+        for attempt in 0..8 {
+            match KmsSurface::open("/dev/dri/card0", cfg.display.refresh) {
+                Ok(opened) => {
+                    surface = Some(opened);
+                    break;
+                }
+                Err(e) if attempt + 1 < 8 && momentary_commit_failure(&e) => {
+                    let _ = skyward_sys::kmsg(&format!("display: the panel refused the mode ({e:#}); trying again"));
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let mut surface = surface.expect("the loop ends with a panel or an error");
         let (w, h) = surface.size();
+        let dp = cfg.display.density as f32 / 160.0;
+        // A pad is held portrait even though its panel scans out landscape.
+        // The pages get the portrait canvas; the panel gets a turned copy.
+        // Touch still arrives in the panel's own coordinates, so the
+        // configured axis mapping is left exactly as it was calibrated.
+        let rotation = Rotation::from_degrees(cfg.display.rotate);
+        let tablet = Tablet::new(w, h, rotation, cfg.display.columns, dp);
+        let (page_w, page_h) = tablet.page_size();
         // A touch controller that follows the panel wakes as the panel goes
         // from rest to running, and at no other time. The recovery service
         // running again finds it as the earlier run left it, at rest where the
@@ -1252,7 +1316,7 @@ impl<'a> Pages<'a> {
             surface.settle()?;
         }
         eprintln!("display {}", surface.describe());
-        let inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
+        let inputs = Inputs::open(w, h, cfg.touch.writes.clone(), cfg.touch.reversed.clone())?;
         let started = Instant::now();
         let control = Control::open()?;
         let haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
@@ -1273,8 +1337,20 @@ impl<'a> Pages<'a> {
             | Work::SwitchSystem { .. }
             | Work::SystemStopped => start,
         };
-        let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
-        app.set_screen_corners(cfg.display.corner_radius as f32);
+        let mut app = App::new(first, page_w, page_h, dp);
+        // Only a page that reaches the panel's own left edge rounds its
+        // leading corners as the panel's are. A pad's page starts at the
+        // navigation column instead, in the middle of the panel: rounding it
+        // there would cut a notch into the divider at the top and the foot
+        // of every page that slides in or out.
+        if cfg.display.columns == 0 {
+            app.set_screen_corners(cfg.display.corner_radius as f32);
+        }
+        // A pad with no motor shows no vibration setting, and its permanent
+        // navigation column already carries the wordmark the home page
+        // would otherwise put at its own top left.
+        app.state.has_vibrator = cfg.device.supports_vibration;
+        app.state.tablet = cfg.display.columns > 0;
         // The settings kept from the starts before are back before the first
         // frame, and before file transfer starts with its switch and the time
         // zone. The pages speak the language chosen then, or else the one the
@@ -1284,6 +1360,13 @@ impl<'a> Pages<'a> {
         let locale = request.locale.as_deref().or(info.locale.as_deref());
         let named = locale.map(Lang::for_locale).transpose()?;
         app.take_settings(kept.settings(), named);
+        // A build without file transfer keeps adb as the only USB function:
+        // nothing may start the MTP service or ask init to rebind the
+        // gadget, which is what drops adb on a Windows host.
+        app.state.mtp = cfg.mtp;
+        if !cfg.mtp {
+            app.state.file_transfer = false;
+        }
         let keeper = Keeper::new(&kept);
         skyward_sys::kmsg(&format!(
             "the pages speak {:?}, {}, and the locale named is {}",
@@ -1300,13 +1383,13 @@ impl<'a> Pages<'a> {
         let screen = Canvas::new(w, h);
         // A page sliding over another draws on three screens' worth of canvas
         // besides the panel's: made ready now, the first slide finds them so.
-        Canvas::keep_ready(w, h, 3);
+        Canvas::keep_ready(page_w, page_h, 3);
         let readings = Readings::start(cfg)?;
         let read_at = Instant::now();
         let fastboot = first == Screen::Fastboot;
         let port_at = Instant::now();
         let mut transfer: Option<Transfer> = None;
-        if app.state.file_transfer {
+        if cfg.mtp && app.state.file_transfer {
             match Transfer::start(cfg, &info, app.state.time_zone) {
                 Ok(t) => transfer = Some(t),
                 Err(e) => {
@@ -1341,7 +1424,8 @@ impl<'a> Pages<'a> {
         let by_name = Path::new(skyward_block::BY_NAME);
         let both = |base: &str| -> Result<bool> { Ok(by_name.join(format!("{base}_a")).try_exists()? && by_name.join(format!("{base}_b")).try_exists()?) };
         app.state.recovery_partitions = both("recovery")?;
-        app.state.dual_boot = app.state.recovery_partitions && both("boot")? && both("init_boot")?;
+        // This build carries no first program for a second system.
+        app.state.dual_boot = false;
         // The second system's work; the systems are read at once, for the home
         // page to name the one that starts, once a switch cut off before is
         // finished.
@@ -1375,6 +1459,7 @@ impl<'a> Pages<'a> {
             fonts,
             surface,
             screen,
+            tablet,
             inputs,
             started,
             touch_known: false,
@@ -1527,11 +1612,59 @@ impl<'a> Pages<'a> {
         }
         if let Some(slot) = self.info.slot {
             let standing = skyward_vab::standing(slot)?;
-            if matches!(standing, Standing::Merging(_)) && skyward_vab::snapshots_mapped(slot)? {
-                skyward_sys::kmsg("the update's merge goes on")?;
-                self.merger = Some(merge::Merger::start(slot, false)?);
+            // An update is merged where its snapshots lie: the slot the
+            // phone runs from where the update went to it, or the other
+            // slot, whose merge the recovery started after installing the
+            // package there, and a power cut may have stopped halfway.
+            let elsewhere = skyward_vab::unmerged_target(slot)?.filter(|target| *target != slot);
+            if matches!(standing, Standing::Merging(_)) {
+                if let Some(target) = elsewhere {
+                    skyward_sys::kmsg(&format!("the merge into slot {} was cut off; it goes on", target.letter()))?;
+                    match skyward_vab::map_snapshots(target) {
+                        Ok(mapped) => {
+                            skyward_sys::kmsg(&format!("{} snapshots of slot {} are mapped again", mapped.len(), target.letter()))?;
+                            self.merger = Some(merge::Merger::start(target, false)?);
+                        }
+                        Err(e) => skyward_sys::kmsg(&format!("the update's snapshots are not mapped: {e:#}"))?,
+                    }
+                    self.app.set_update(standing);
+                } else if skyward_vab::snapshots_mapped(slot)? {
+                    skyward_sys::kmsg("the update's merge goes on")?;
+                    self.merger = Some(merge::Merger::start(slot, false)?);
+                    self.app.set_update(standing);
+                } else {
+                    self.app.set_update(standing);
+                }
+            } else if matches!(standing, Standing::Waiting) {
+                // A virtual A/B update can be left at `Unverified` after a
+                // full package was written to the slot that now starts:
+                // neither Skyward nor Android's init pushes the snapshot
+                // into a merge, so the slot hangs at the boot screen. Carry
+                // it forward here, the same hand-off the Update page's slide
+                // does, so a plain reboot after installing the package works.
+                // Only when this slot is the snapshot's target (`Waiting`
+                // already means that), and nothing else is merging.
+                skyward_sys::kmsg("the new system starts here with its update unmerged; merging it now")?;
+                // Say plainly what this costs: merging writes the snapshot
+                // into the base partitions, so the system from before the
+                // update cannot be brought back. The user accepted this by
+                // installing the package; leave the warning in the log.
+                skyward_sys::kmsg("merging is irreversible: the system before the update cannot come back")?;
+                // A merge takes every snapshot of the slot at once, and the
+                // recovery may not have mapped this slot through them yet
+                // (nothing has to be mounted for the merge itself).
+                if let Err(e) = skyward_vab::map_snapshots(slot) {
+                    skyward_sys::kmsg(&format!("the update's snapshots are not mapped: {e:#}"))?;
+                }
+                self.merger = Some(merge::Merger::start(slot, true)?);
+                // The slide-to-merge button is only drawn while `Waiting`.
+                // Show `Merging` at once so it goes away: leaving `Waiting`
+                // here let a quick tap push a second Effect::Merge, whose
+                // guard below used to abort the whole recovery service.
+                self.app.set_update(Standing::Merging(0.0));
+            } else {
+                self.app.set_update(standing);
             }
-            self.app.set_update(standing);
         }
         // The WLAN starts off. Without the bundle of the vendor interface's
         // libraries the supplicant does not start, and the WLAN page says why.
@@ -1543,6 +1676,20 @@ impl<'a> Pages<'a> {
                 None
             });
             self.wlan = Some(wlan::Worker::start(w.clone(), modules, libraries, self.servers.clone())?);
+            // The network kept from the last start is joined again where
+            // its switch is on. Both commands go into the worker's queue in
+            // order, so the join waits for the power-on to finish.
+            if let Some(saved) = self.app.state.saved_wlan.clone().filter(|_| self.app.state.wlan_auto) {
+                let worker = self.wlan.as_mut().expect("started above");
+                let _ = worker.send(wlan::Command::On);
+                let _ = worker.send(wlan::Command::Join {
+                    ssid: saved.ssid_bytes(),
+                    name: saved.name,
+                    security: saved.security,
+                    password: saved.password,
+                });
+                skyward_sys::kmsg("the saved WLAN is being joined again")?;
+            }
         }
         self.scanned_at = Instant::now();
         self.app.state.update_server = cfg.update.is_some();
@@ -1608,6 +1755,11 @@ impl<'a> Pages<'a> {
         self.decrypt_told(now)?;
         self.shell_told()?;
         self.take_in(drive_told, now)?;
+        // File transfer follows the data partition being readable, not the
+        // decrypt page: data may already be open on a start that never runs
+        // a decrypt job. The call is idempotent and returns at once once a
+        // transfer is up, so checking every turn is cheap.
+        self.enable_mtp_after_decrypt()?;
         self.offer_storage(now)
     }
 
@@ -1689,11 +1841,31 @@ impl<'a> Pages<'a> {
     fn show(&mut self, now: u64) -> Result<(bool, bool)> {
         let panel = self.app.panel(now);
         let mut shown = false;
+        // The lock owns the whole logical canvas, not a tablet's detail
+        // pane: give the pages the full size, compose straight onto whole
+        // (skipping the navigation column) and let every touch reach it.
+        // Leaving the lock puts the page size back.
+        if self.app.lockscreen() {
+            let (w, h) = self.tablet.logical_size();
+            self.app.set_full_screen(w, h);
+        } else {
+            self.app.restore_page_size();
+        }
+        let lock = self.app.lockscreen();
         if panel.is_some() {
             // A display turned off comes on again with a frame drawn for it.
             if self.app.take_dirty() || !self.surface.is_on() {
                 let t0 = Instant::now();
-                self.app.compose(&mut self.screen, &self.fonts, &self.info, &self.shown_clock, now);
+                if lock {
+                    self.app.compose_pages(&mut self.tablet.whole, &self.fonts, &self.info, &self.shown_clock, now);
+                } else {
+                    self.app.compose_pages(&mut self.tablet.detail, &self.fonts, &self.info, &self.shown_clock, now);
+                    self.tablet.assemble(&self.fonts, &self.app);
+                }
+                // The status bar, charging screen and sleep curtain cover
+                // the whole panel, not only a tablet's detail pane.
+                self.app.compose_overlays(&mut self.tablet.whole, &self.fonts, &self.info, &self.shown_clock, now);
+                self.tablet.turn(&mut self.screen);
                 self.surface.present(&self.screen)?;
                 eprintln!("frame {:?} in {} ms", self.app.screen(), t0.elapsed().as_millis());
                 if let Some(path) = self.dump {
@@ -1722,6 +1894,13 @@ impl<'a> Pages<'a> {
             // Lit, a panel that came on again switches to its fastest
             // refresh.
             self.surface.speed_up()?;
+            self.rested_at = None;
+        } else if self.app.state.double_tap {
+            // Where a double tap lights the panel again, only the backlight
+            // went off: keep the panel and the touch controller on. The
+            // dijun rest/turn_off path unbinds the planes and lets this
+            // pad's touch suspend, which would leave no way to tap. This is
+            // why the switch is off by default.
             self.rested_at = None;
         } else if self.surface.is_on() {
             // With the backlight off, the panel rests, and the touch
@@ -1872,6 +2051,19 @@ impl Pages<'_> {
             let installed = matches!(ev, Told::Finished(Outcome::Installed { .. } | Outcome::Ran { .. }));
             let wipe_after = matches!(ev, Told::Finished(Outcome::Installed { wipe: true, .. }));
             let script_cache = matches!(ev, Told::Finished(Outcome::Ran { wipe_cache: true, .. }));
+            // Read where the update stands as the install ends, so the page
+            // that says it succeeded also says whether a restart starts the
+            // system it wrote. The installer merges an update into the slot
+            // it went to before it reports; one whose merge did not finish
+            // leaves a slot that cannot start, and must not be rebooted
+            // into by the request that asked for the update.
+            let after = match (&ev, self.info.slot) {
+                (Told::Finished(Outcome::Installed { .. }), Some(slot)) => Some(skyward_vab::standing(slot)?),
+                _ => None,
+            };
+            if let Some(standing) = &after {
+                self.app.set_update(standing.clone());
+            }
             // A second system installed is read for the pages to show.
             if matches!(ev, Told::Done(Outcome::SystemInstalled { .. }) | Told::Finished(Outcome::SystemInstalled { .. })) {
                 self.systems_worker.as_mut().context("a second system went in on a phone that cannot hold one")?.send(systems::Task::Read);
@@ -1897,6 +2089,11 @@ impl Pages<'_> {
             if finished {
                 self.installer = None;
                 self.sideloading = false;
+                // The boot slot is update_engine's to set: it calls
+                // SetActiveBootSlot when the payload is applied. Setting it
+                // again here would only repeat that in the middle of a
+                // virtual A/B update, whose snapshots and first boot must
+                // run their own course before the update is confirmed.
                 // A sideload or an update the system asked for is done
                 // with however it went, and so is rescue, once its page
                 // is left or the computer asks the phone to leave. A
@@ -1908,7 +2105,12 @@ impl Pages<'_> {
                 }
                 let (leaves, cache_after) = match &self.request.work {
                     Work::Sideload { auto_reboot } => (*auto_reboot, script_cache),
-                    Work::Update(update) => (installed, script_cache || (installed && update.wipe_cache)),
+                    // A request that asked for an update leaves for the new
+                    // system only where that slot can start: an update
+                    // still waiting to merge, or one whose merge failed,
+                    // starts nothing, and leaving would land on the vendor
+                    // logo. The page says what is left to do instead.
+                    Work::Update(update) => (installed && after.as_ref().is_none_or(Standing::starts), script_cache || (installed && update.wipe_cache)),
                     _ => (false, script_cache),
                 };
                 if cache_after && !self.app.state.cache_partition {
@@ -2355,6 +2557,8 @@ impl Pages<'_> {
                 self.app.unlock_failed(why, now);
             }
         }
+        // File transfer is started from turn() once data is readable, whether
+        // or not this update came through the decrypt page.
         // Screenshots taken while internal storage was closed go into
         // the gallery's once it opens.
         if self.app.state.place_open(Place::Storage)
@@ -2456,7 +2660,41 @@ impl Pages<'_> {
                     skyward_sys::kmsg(&format!("asked on the recovery socket: {asked:?}"))?;
                     answer(asked, self.fastboot)
                 }
-                Incoming::Input(Event::Touch(t, at)) => self.app.touch(t, &self.fonts, at),
+                Incoming::Input(Event::Touch(t, at)) => {
+                    // With the panel dark there is no page or column to
+                    // pick: every touch is a double-tap candidate. Routing
+                    // through the column first would hand the left 560 px
+                    // to `Input::Sidebar`, which never reaches App::touch
+                    // where the double-tap is detected. Use whole-canvas
+                    // coordinates for those taps, as the lock page does.
+                    let routed = if self.app.lockscreen()
+                        || (!self.app.display_on() && self.app.state.double_tap)
+                    {
+                        tablet::Input::Detail(self.tablet.route_whole(t))
+                    } else {
+                        self.tablet.route(t)
+                    };
+                    match routed {
+                        tablet::Input::Detail(t) => self.app.touch(t, &self.fonts, at),
+                        tablet::Input::Select(screen) => {
+                            // The side column must not change page while an
+                            // install or a restore is writing: the keys and
+                            // the back swipe already refuse to, and this was
+                            // the one way around that rule.
+                            if self.app.navigation_open() {
+                                self.app.select_section(screen, now)
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        tablet::Input::Sidebar => {
+                            // The column highlights the row held; that is
+                            // drawn outside the pages, so ask for a frame.
+                            self.app.redraw();
+                            Vec::new()
+                        }
+                    }
+                }
                 Incoming::Input(Event::Key(k, true)) => self.app.key(k, now),
                 Incoming::Input(Event::Key(k, false)) => self.app.key_up(k, now),
             };
@@ -2594,10 +2832,60 @@ impl Pages<'_> {
                 self.app.set_boot_slots(read_slots());
             }
             Effect::Merge => {
-                ensure!(self.merger.is_none(), "the update is being merged already");
+                // Idempotent: begin() may already have started the merge on
+                // a `Waiting` update. A late tap on the slide button must
+                // not abort recovery through a failed `ensure!` — just say
+                // so and carry on watching the merge already in progress.
+                if self.merger.is_some() {
+                    skyward_sys::kmsg("the update is being merged already")?;
+                    return Ok(Vec::new());
+                }
                 let slot = self.info.slot.context("only an A/B phone merges an update")?;
-                skyward_sys::kmsg("merging the update, as the update page asked")?;
-                self.merger = Some(merge::Merger::start(slot, true)?);
+                // The update is merged where its snapshots lie: the slot
+                // the phone runs from where the update went to it, and the
+                // other slot where the update came from — the case after an
+                // install whose own merge did not finish.
+                let Some(target) = skyward_vab::unmerged_target(slot)? else {
+                    skyward_sys::kmsg("no update waits to be merged")?;
+                    self.app.set_update(skyward_vab::standing(slot)?);
+                    return Ok(Vec::new());
+                };
+                skyward_sys::kmsg(&format!("merging the update in slot {}, as the update page asked", target.letter()))?;
+                // A slot the phone does not run from has nothing mapped:
+                // its snapshots are mapped here first, as first-stage init
+                // would map them, since a merge needs every one of them.
+                if let Err(e) = skyward_vab::map_snapshots(target) {
+                    skyward_sys::kmsg(&format!("the update's snapshots are not mapped: {e:#}"))?;
+                    self.app.report(&format!("{e:#}"), now);
+                    self.app.set_update(skyward_vab::standing(slot)?);
+                    return Ok(Vec::new());
+                }
+                self.merger = Some(merge::Merger::start(target, true)?);
+            }
+            Effect::DisableAvb => {
+                // Clear both verified-boot flags in the running slot's
+                // vbmeta. This writes a startup-critical partition, so a
+                // failure is only reported on the page; it never ends the
+                // recovery. avbctl refuses a locked bootloader.
+                skyward_sys::kmsg("disabling AVB checks, as the Advanced page asked")?;
+                let l = self.app.state.lang;
+                let said = match skyward_install::commands::disable_avb() {
+                    Ok(()) => {
+                        skyward_sys::kmsg("AVB checks are now disabled in the running slot")?;
+                        l.pick([
+                            "已关闭当前槽位的 AVB 验证（dm-verity 与启动校验），重启后生效。",
+                            "已關閉目前槽位的 AVB 驗證（dm-verity 與啟動校驗），重新啟動後生效。",
+                            "AVB checks are off in the running slot. Restart for the change to take effect.",
+                        ])
+                        .to_string()
+                    }
+                    Err(e) => {
+                        let why = format!("{e:#}");
+                        let _ = skyward_sys::kmsg(&format!("could not disable AVB checks: {why}"));
+                        format!("{}\n{}", l.pick(["关闭 AVB 验证失败：", "關閉 AVB 驗證失敗：", "Couldn't disable AVB:"]), why)
+                    }
+                };
+                self.app.report(&said, now);
             }
             Effect::Wlan(on) => wlan_worker(&self.wlan)?.send(if on { wlan::Command::On } else { wlan::Command::Off }),
             Effect::ScanWlan => {
@@ -2605,6 +2893,7 @@ impl Pages<'_> {
                 wlan_worker(&self.wlan)?.send(wlan::Command::Scan);
             }
             Effect::JoinWlan { ssid, name, security, password } => {
+                self.app.remember_wlan(&ssid, &name, security, &password.0);
                 wlan_worker(&self.wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
             }
             Effect::LeaveWlan => wlan_worker(&self.wlan)?.send(wlan::Command::Leave),
@@ -2627,6 +2916,32 @@ impl Pages<'_> {
                 let path = Path::new(skyward_sys::RUN).join(&build.name);
                 let task = updates::Task::UpdateSkyward { build, codename: cfg.device.codename.clone(), path };
                 self.skyward_updater = Some(updates::Worker::start(task, self.servers.clone())?);
+            }
+            Effect::UpdateSkywardFile => {
+                // A missing local image, or a worker that cannot start, is
+                // the page's to report: an error here would bubble out of
+                // the loop and end the whole recovery.
+                let path = Path::new(skyward_crypto::data::SDCARD).join(DOWNLOADS).join("recovery.img");
+                let why = if !path.exists() {
+                    Some(format!("there is no {}", path.display()))
+                } else if self.skyward_updater.is_some() {
+                    Some("Skyward is being updated already".into())
+                } else if self.installer.is_some() {
+                    Some("an installer is running already".into())
+                } else {
+                    None
+                };
+                match why {
+                    Some(why) => self.app.skyward_ended(SkywardEnd::NotWritten(why), now),
+                    None => {
+                        let _ = skyward_sys::kmsg(&format!("updating Skyward from {}", path.display()));
+                        let task = updates::Task::UpdateSkywardFile { path, codename: cfg.device.codename.clone() };
+                        match updates::Worker::start(task, self.servers.clone()) {
+                            Ok(worker) => self.skyward_updater = Some(worker),
+                            Err(e) => self.app.skyward_ended(SkywardEnd::NotWritten(format!("{e:#}")), now),
+                        }
+                    }
+                }
             }
             Effect::StopSkywardUpdate => self.skyward_updater.as_ref().context("Skyward is not being updated")?.stop(),
             // Logs that cannot be saved are the page's to report;
@@ -2986,19 +3301,80 @@ impl Pages<'_> {
         Ok(())
     }
 
+    /// Bring file transfer up by itself once the data partition is open.
+    /// The port came up adb-only, so the gadget rebind and the Windows
+    /// re-enumeration that follows it happen here, after the owner has
+    /// decrypted their files, never during boot. `offer_storage()` then
+    /// gives the computer internal storage on its own.
+    fn enable_mtp_after_decrypt(&mut self) -> Result<()> {
+        if !self.cfg.mtp_after_decrypt
+            || self.transfer.is_some()
+            || !self.app.state.data.storage_open()
+            || self.fastboot
+            || self.sideloading
+            || self.eraser.is_some()
+            || self.installer.is_some()
+        {
+            return Ok(());
+        }
+        match Transfer::start(self.cfg, &self.info, self.app.state.time_zone) {
+            Ok(t) => {
+                // Transfer::start has set the MTP flag, so resting() now
+                // names mtp,adb. The switch goes through "none" to unbind
+                // the gadget; that is expected here, and adb comes back
+                // with it (or with `adb kill-server` on a Windows host).
+                // Keep `self.transfer` unset until the switch succeeds: if
+                // "none" took but "mtp,adb" did not, the port would sit at
+                // none with neither adb nor MTP, and a `transfer.is_some()`
+                // early return would stop us ever trying again. Roll the
+                // service back to adb on failure instead.
+                match skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT) {
+                    Ok(()) => {
+                        self.transfer = Some(t);
+                        skyward_sys::kmsg("file transfer came up once data was decrypted")?;
+                    }
+                    Err(e) => {
+                        skyward_sys::kmsg(&format!("the port did not take file transfer, back to adb: {e:#}"))?;
+                        if let Err(back) = t.stop(true) {
+                            skyward_sys::kmsg(&format!("the port did not return to adb either: {back:#}"))?;
+                        }
+                        self.app.state.file_transfer = false;
+                    }
+                }
+            }
+            Err(e) => skyward_sys::kmsg(&format!("file transfer did not start after decryption: {e:#}"))?,
+        }
+        Ok(())
+    }
+
     /// Turn file transfer on or off. A port that something else has takes
     /// file transfer on, or leaves it, when it comes back to rest.
     fn file_transfer(&mut self, on: bool, now: u64) -> Result<()> {
+        if !self.cfg.mtp {
+            self.app.state.file_transfer = false;
+            return Ok(());
+        }
         let rests = !self.fastboot && !self.sideloading;
         match (on, self.transfer.take()) {
             (true, None) => match Transfer::start(self.cfg, &self.info, self.app.state.time_zone) {
                 Ok(t) => {
-                    self.transfer = Some(t);
-                    if rests
-                        && let Err(e) = skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)
-                    {
-                        skyward_sys::kmsg(&format!("the port did not take file transfer: {e:#}"))?;
-                        self.app.report(&format!("{e:#}"), now);
+                    let switched = if rests {
+                        skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)
+                    } else {
+                        Ok(())
+                    };
+                    match switched {
+                        Ok(()) => self.transfer = Some(t),
+                        Err(e) => {
+                            // The gadget may be sitting at "none" now. Give
+                            // adb back rather than leave the port dead; the
+                            // user can try the switch again from the page.
+                            skyward_sys::kmsg(&format!("the port did not take file transfer, back to adb: {e:#}"))?;
+                            if let Err(back) = t.stop(true) {
+                                skyward_sys::kmsg(&format!("the port did not return to adb either: {back:#}"))?;
+                            }
+                            self.app.file_transfer_failed(false, &skyward_ui::fmt::transfer_failed(self.app.state.lang, &format!("{e:#}")), now);
+                        }
                     }
                 }
                 Err(e) => {

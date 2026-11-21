@@ -14,6 +14,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 
 mod avbctl;
+pub use avbctl::disable_both as disable_avb;
 mod resetprop;
 mod sevenzip;
 mod unzip;

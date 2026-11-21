@@ -189,6 +189,11 @@ enum SystemProps {
 /// log was told: the details are collected again and again.
 static PROPS_UNREAD: Mutex<ToldOnce> = Mutex::new(ToldOnce::new());
 
+/// The last properties read from a system, and the slot they describe: an
+/// install takes that slot's partitions off before it writes, and the pages
+/// go on describing the system the phone runs from until it starts another.
+static PROPS_KEPT: Mutex<Option<(Slot, HashMap<String, String>)>> = Mutex::new(None);
+
 impl SystemProps {
     /// A recovery has to come up whatever state the installed system's
     /// partitions are in, so properties that cannot be read are none, as
@@ -198,7 +203,7 @@ impl SystemProps {
             return Ok(SystemProps::Running);
         }
         let read = match skyward_vab::current_slot()? {
-            Some(slot) => installed_props(slot),
+            Some(slot) => installed_props(slot).map(|props| kept_props(slot, props)),
             None => Ok(HashMap::new()),
         };
         let why = read.as_ref().err().map(|e| format!("{e:#}"));
@@ -213,6 +218,25 @@ impl SystemProps {
             SystemProps::Running => prop(name),
             SystemProps::Installed(props) => props.get(name).cloned(),
         }
+    }
+}
+
+/// What the partitions of `slot` hold now, or what they held the last time
+/// they could be read: an install unmounts them, and the version it shows,
+/// the release and the locale are still the running system's — the one an
+/// update in the other slot leaves alone.
+fn kept_props(slot: Slot, props: HashMap<String, String>) -> HashMap<String, String> {
+    /// A system's own build.prop names the release; with no partition
+    /// mounted there is only what the bootloader passes.
+    const SYSTEM: &str = "ro.build.version.release";
+    let mut kept = PROPS_KEPT.lock().expect("nothing panics while it is held");
+    if props.contains_key(SYSTEM) {
+        *kept = Some((slot, props.clone()));
+        return props;
+    }
+    match kept.as_ref() {
+        Some((was, props)) if *was == slot => props.clone(),
+        _ => props,
     }
 }
 

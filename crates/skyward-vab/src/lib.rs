@@ -6,13 +6,15 @@ use std::path::Path;
 
 #[cfg(target_os = "android")]
 pub mod boot;
+#[cfg(target_os = "android")]
+pub mod merge;
 mod partitions;
 pub mod snapshots;
 
 pub use partitions::{
-    check_merge, map_slot, map_whole, mount_one, mount_partitions, mount_point, mounted_partitions, release_partitions, slot_bases,
-    slot_sizes, snapshots_mapped, start_merge, unmap_slot, unmap_whole, unmount_one, unmount_partitions, Mounted, Mounts, SlotMaps,
-    Whole,
+    check_merge, map_slot, map_snapshots, map_whole, mount_one, mount_partitions, mount_point, mounted_partitions, release_partitions,
+    slot_bases, slot_sizes, snapshots_mapped, start_merge, unmap_slot, unmap_whole, unmount_one, unmount_partitions, Mounted, Mounts,
+    SlotMaps, Whole,
 };
 pub use snapshots::Merge;
 
@@ -263,6 +265,19 @@ impl Update {
     }
 }
 
+impl Standing {
+    /// Whether the system the update was written for can start as it
+    /// stands. An update is only snapshots until they are merged into the
+    /// partitions they snapshot, and first-stage init reads them from the
+    /// data partition, which it cannot open: a slot whose snapshots still
+    /// wait to be merged, or whose merge failed, has nothing the bootloader
+    /// can start. Snapshots served by snapuserd are the system's own to
+    /// merge when it runs, and start.
+    pub fn starts(&self) -> bool {
+        matches!(self, Standing::None | Standing::Merged | Standing::Compressed)
+    }
+}
+
 pub fn snapshot_state() -> Result<SnapshotState> {
     if !skyward_block::mount::is_mount_point(Path::new(METADATA))? {
         return Ok(SnapshotState::Unknown);
@@ -386,6 +401,21 @@ pub fn standing(current: Slot) -> Result<Standing> {
         UpdateState::MergeFailed => Standing::Failed(FailureCode::try_from(update.merge_failure_code).unwrap_or(FailureCode::Ok)),
         UpdateState::MergeNeedsReboot | UpdateState::MergeCompleted => Standing::Merged,
     })
+}
+
+/// The slot an update's snapshots lie in and still wait to be merged into,
+/// from `current`: the slot the phone runs from where the update went to
+/// it, and the other slot where the update came from. `None` where nothing
+/// waits to be merged, or where /metadata cannot be read.
+pub fn unmerged_target(current: Slot) -> Result<Option<Slot>> {
+    if !skyward_block::mount::is_mount_point(Path::new(METADATA))? {
+        return Ok(None);
+    }
+    let Some(snaps) = snapshots::Snapshots::lock(false)? else { return Ok(None) };
+    if snaps.needed(current)? {
+        return Ok(Some(current));
+    }
+    Ok(snaps.needed(current.other())?.then(|| current.other()))
 }
 
 /// Mount /metadata writable, to merge an update, or read-only again.
